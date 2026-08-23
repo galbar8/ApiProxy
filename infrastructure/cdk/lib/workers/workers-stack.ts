@@ -28,8 +28,38 @@ export interface WorkersStackProps extends StackProps {
   readonly table: dynamodb.Table;
   readonly startQueue: sqs.Queue;
   readonly stepQueue: sqs.Queue;
+  /**
+   * External provider endpoint. Production must name a real HTTPS host: the placeholder
+   * would point every finalizer at a name that does not resolve.
+   */
   readonly providerBaseUrl: string;
 }
+
+/**
+ * A defaulted provider URL fails loudly rather than corrupting state — every call errors,
+ * the DLQ fills and the alarms fire — but it is the same class of "forgot the context
+ * value" mistake that `certificateArn` already refuses to allow, and there is no reason to
+ * discover it after a deployment instead of during synth.
+ */
+export const assertUsableProviderUrl = (providerBaseUrl: string): void => {
+  let parsed: URL;
+  try {
+    parsed = new URL(providerBaseUrl);
+  } catch {
+    throw new Error(`providerBaseUrl is not a URL: ${providerBaseUrl}`);
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(
+      `production requires an https providerBaseUrl; received ${providerBaseUrl}`,
+    );
+  }
+  if (parsed.hostname.endsWith(".invalid") || parsed.hostname.endsWith(".example")) {
+    throw new Error(
+      `providerBaseUrl is still the placeholder (${providerBaseUrl}); pass the real ` +
+        "provider endpoint with -c providerBaseUrl=",
+    );
+  }
+};
 
 /**
  * The asynchronous half of the system.
@@ -48,6 +78,10 @@ export class WorkersStack extends Stack {
   constructor(scope: Construct, id: string, props: WorkersStackProps) {
     super(scope, id, props);
     const { config, table, startQueue, stepQueue } = props;
+
+    if (config.isProduction) {
+      assertUsableProviderUrl(props.providerBaseUrl);
+    }
 
     const commonEnvironment = {
       APP_ENV: config.envName,

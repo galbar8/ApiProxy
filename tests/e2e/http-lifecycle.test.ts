@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import type { RequestId } from "@workflow/contracts";
@@ -19,8 +20,34 @@ import {
  */
 const API_KEY = "e2e-live-key-01234567890";
 const tableName = uniqueTableName("http-lifecycle");
-const port = 8181;
-const baseUrl = `http://127.0.0.1:${String(port)}`;
+
+/**
+ * A fixed port makes this suite order-dependent: the previous run's process may still hold
+ * it while the socket lingers in TIME_WAIT, and the failure then looks like a product bug
+ * (`ECONNREFUSED`, a status of `undefined`) rather than the harness fault it is. Ask the
+ * kernel for a free port instead — adversarial conditions in these tests are injected
+ * deliberately, never inherited from the environment.
+ */
+const reserveEphemeralPort = async (): Promise<number> =>
+  await new Promise<number>((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (address === null || typeof address === "string") {
+        probe.close();
+        reject(new Error("could not reserve a port"));
+        return;
+      }
+      const { port: reserved } = address;
+      probe.close(() => {
+        resolve(reserved);
+      });
+    });
+  });
+
+let port: number;
+let baseUrl: string;
 
 const keyDocument = JSON.stringify({
   tenants: [
@@ -89,6 +116,8 @@ const post = async (idempotencyKey: string, signal?: AbortSignal): Promise<Respo
   });
 
 beforeAll(async () => {
+  port = await reserveEphemeralPort();
+  baseUrl = `http://127.0.0.1:${String(port)}`;
   dynamo = createLocalDynamoClient();
   await ensureTable(dynamo, tableName);
   repository = new WorkflowRepository({
@@ -106,7 +135,15 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  server?.kill("SIGKILL");
+  if (server?.exitCode === null) {
+    const exited = new Promise<void>((resolve) => {
+      server?.once("exit", () => {
+        resolve();
+      });
+    });
+    server.kill("SIGKILL");
+    await exited;
+  }
   await dropTable(dynamo, tableName);
 });
 

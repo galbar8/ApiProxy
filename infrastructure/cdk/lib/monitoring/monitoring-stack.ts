@@ -1,9 +1,13 @@
-import { Duration, Stack, type StackProps } from "aws-cdk-lib";
+import { CfnOutput, Duration, Stack, type StackProps } from "aws-cdk-lib";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as actions from "aws-cdk-lib/aws-cloudwatch-actions";
+import * as events from "aws-cdk-lib/aws-events";
+import * as eventTargets from "aws-cdk-lib/aws-events-targets";
 import * as sns from "aws-cdk-lib/aws-sns";
+import * as subscriptions from "aws-cdk-lib/aws-sns-subscriptions";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
+import type * as ecs from "aws-cdk-lib/aws-ecs";
 import type * as lambda from "aws-cdk-lib/aws-lambda";
 import type * as sqs from "aws-cdk-lib/aws-sqs";
 import type { Construct } from "constructs";
@@ -17,7 +21,13 @@ export interface MonitoringStackProps extends StackProps {
   readonly functions: readonly { name: string; fn: lambda.IFunction }[];
   readonly loadBalancer: elbv2.ApplicationLoadBalancer;
   readonly targetGroup: elbv2.ApplicationTargetGroup;
+  readonly service: ecs.FargateService;
   readonly streamDlq: sqs.Queue;
+  /**
+   * Where alarms are delivered. Required outside dev: an alarm that reaches nobody is
+   * not a failure mechanism, it is a record written for an audit that never happens.
+   */
+  readonly alarmEmails: readonly string[];
 }
 
 /**
@@ -35,9 +45,26 @@ export class MonitoringStack extends Stack {
     super(scope, id, props);
     const { config } = props;
 
+    if (config.isProduction && props.alarmEmails.length === 0) {
+      throw new Error(
+        "production requires at least one alarm subscriber (context: alarmEmails, " +
+          "comma-separated); a topic with no subscription turns every alarm below into " +
+          "a metric nobody reads",
+      );
+    }
+
     this.alarmTopic = new sns.Topic(this, "AlarmTopic", {
       displayName: `${config.envName} workflow service alarms`,
+      enforceSSL: true,
     });
+    for (const email of props.alarmEmails) {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        throw new Error(
+          `alarmEmails contains a value that is not an address: ${email}`,
+        );
+      }
+      this.alarmTopic.addSubscription(new subscriptions.EmailSubscription(email));
+    }
 
     const alarm = (
       id_: string,
@@ -46,6 +73,10 @@ export class MonitoringStack extends Stack {
       description: string,
       evaluationPeriods = 1,
       comparison = cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      // Most alarms here count bad events, so absent data means nothing bad happened.
+      // Alarms that watch for the *presence* of something healthy must invert this, or a
+      // total outage silences them exactly when they matter.
+      treatMissingData = cloudwatch.TreatMissingData.NOT_BREACHING,
     ): cloudwatch.Alarm => {
       const created = new cloudwatch.Alarm(this, id_, {
         metric,
@@ -53,7 +84,7 @@ export class MonitoringStack extends Stack {
         evaluationPeriods,
         comparisonOperator: comparison,
         alarmDescription: description,
-        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        treatMissingData,
       });
       created.addAlarmAction(new actions.SnsAction(this.alarmTopic));
       return created;
@@ -108,7 +139,41 @@ export class MonitoringStack extends Stack {
         0,
         `${entry.name} is being throttled; concurrency is insufficient`,
       );
+      // A function creeping toward its timeout is invisible in the error metric until it
+      // starts failing — and a finalizer that times out mid-provider-call produces exactly
+      // the UNKNOWN_EXTERNAL_STATE the design works hardest to avoid.
+      alarm(
+        `${entry.name}Duration`,
+        entry.fn.metricDuration({ period: Duration.minutes(5), statistic: "p95" }),
+        config.lambdaTimeout.toMilliseconds() * 0.8,
+        `${entry.name} p95 duration is within 20% of its timeout`,
+        2,
+      );
     }
+
+    // ---- ECS capacity --------------------------------------------------------
+    // Autoscaling targets 60% CPU; sustained pressure well above that means scaling is
+    // not keeping up, not that the target is wrong.
+    alarm(
+      "ApiCpuSaturation",
+      props.service.metricCpuUtilization({
+        period: Duration.minutes(5),
+        statistic: "Average",
+      }),
+      85,
+      "API tasks are CPU saturated; autoscaling is not keeping up",
+      3,
+    );
+    alarm(
+      "ApiMemorySaturation",
+      props.service.metricMemoryUtilization({
+        period: Duration.minutes(5),
+        statistic: "Average",
+      }),
+      85,
+      "API tasks are near their memory limit; a task OOM kill is imminent",
+      3,
+    );
 
     // ---- Data ---------------------------------------------------------------
     alarm(
@@ -166,6 +231,49 @@ export class MonitoringStack extends Stack {
       3,
     );
 
+    // The alarm above cannot detect a *total* outage: with every target deregistered,
+    // UnHealthyHostCount reads zero or stops reporting altogether. Watching for the
+    // presence of healthy capacity is the direct signal, and missing data must breach —
+    // "the metric stopped arriving" is the outage, not the absence of one.
+    alarm(
+      "NoHealthyTargets",
+      props.targetGroup.metrics.healthyHostCount({
+        period: Duration.minutes(1),
+        statistic: "Minimum",
+      }),
+      config.minCapacity,
+      "Fewer healthy API tasks than the configured minimum; capacity is degraded or gone",
+      2,
+      cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      cloudwatch.TreatMissingData.BREACHING,
+    );
+
+    // Application 5xx never appear in the ELB 5xx metric: the load balancer forwarded the
+    // request successfully and the service answered badly.
+    alarm(
+      "Target5xx",
+      props.targetGroup.metrics.httpCodeTarget(elbv2.HttpCodeTarget.TARGET_5XX_COUNT, {
+        period: Duration.minutes(5),
+        statistic: "Sum",
+      }),
+      10,
+      "The API is returning 5xx to callers",
+    );
+
+    // The whole contract of this service is latency-shaped: a request either finishes
+    // inside the synchronous wait or returns a deliberate 202 at it. p95 beyond that
+    // ceiling means responses are escaping the budget the ladder is built around.
+    alarm(
+      "TargetLatency",
+      props.targetGroup.metrics.targetResponseTime({
+        period: Duration.minutes(5),
+        statistic: "p95",
+      }),
+      config.syncWaitTimeoutMs / 1000,
+      "p95 response time exceeds the synchronous wait budget",
+      2,
+    );
+
     // ---- Business -----------------------------------------------------------
     // Reliability is not only infrastructure health: a rising workflow failure rate or a
     // stalled outbox is invisible to every metric above.
@@ -207,6 +315,10 @@ export class MonitoringStack extends Stack {
       "Repeated ambiguous provider outcomes; reconciliation load is rising",
     );
 
+    // Emitted with a `reason` dimension at the call site. The metrics writer publishes an
+    // aggregate (dimensionless) series alongside every dimensioned one precisely so this
+    // alarm has something to read; without it the alarm would sit in INSUFFICIENT_DATA
+    // forever and NOT_BREACHING would keep it silent.
     alarm(
       "SyncTimeouts",
       new cloudwatch.Metric({
@@ -219,5 +331,33 @@ export class MonitoringStack extends Stack {
       "Many requests are exceeding the synchronous deadline; callers are seeing 202s",
       2,
     );
+
+    // ---- Deployment ----------------------------------------------------------
+    // The circuit breaker and the rollback alarms in the API stack revert a bad rollout on
+    // their own. That is worthless if it happens silently: an automatic rollback is an
+    // incident that has already occurred, not an incident avoided.
+    const deploymentFailures = new events.Rule(this, "DeploymentStateChange", {
+      description: "ECS deployment failures and rollbacks for the API service",
+      eventPattern: {
+        source: ["aws.ecs"],
+        detailType: ["ECS Deployment State Change"],
+        detail: {
+          eventName: ["SERVICE_DEPLOYMENT_FAILED"],
+        },
+        // Scoped to this service: another service failing to deploy is someone else's page.
+        resources: [props.service.serviceArn],
+      },
+    });
+    deploymentFailures.addTarget(
+      new eventTargets.SnsTopic(this.alarmTopic, {
+        message: events.RuleTargetInput.fromText(
+          `${config.envName}: ECS deployment failed or was rolled back for ` +
+            `${events.EventField.fromPath("$.detail.deploymentId")} — ` +
+            events.EventField.fromPath("$.detail.reason"),
+        ),
+      }),
+    );
+
+    new CfnOutput(this, "AlarmTopicArn", { value: this.alarmTopic.topicArn });
   }
 }

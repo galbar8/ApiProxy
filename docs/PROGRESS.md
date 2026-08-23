@@ -4,7 +4,9 @@ Repository reality, not intent. Updated after every meaningful implementation, p
 blocker, reliability, test or deployment-state change.
 
 **Last updated:** 2026-08-23
-**Current phase:** Phase 8 — review (blocked on user-invoked review skills)
+**Current phase:** Phase 8 — review. `/aws-review` has been run; its CRITICAL (none), HIGH
+(4) and MEDIUM (11) findings are fixed and it must be re-run to confirm.
+`/reliability-review` still has to be run by a human — see B-002.
 **Deployment state:** never deployed. No AWS account, credentials or CLI are configured
 in this environment. Nothing has been created in any AWS account.
 
@@ -20,7 +22,7 @@ in this environment. Nothing has been created in any AWS account.
 | 5     | Workers + simulated provider                                           | Complete                              |
 | 6     | CDK v2 infrastructure                                                  | Complete (synth only; never deployed) |
 | 7     | Integration / e2e / chaos / load suites                                | Complete                              |
-| 8     | `reliability-review` + `aws-review`                                    | **Blocked — see B-002**               |
+| 8     | `reliability-review` + `aws-review`                                    | In progress — see below               |
 
 ## What exists
 
@@ -65,18 +67,21 @@ autoscaling, ECR, Secrets Manager), monitoring (17 alarms).
 
 ## Verification state
 
-All commands run on 2026-08-23 from a clean tree.
+All commands run on 2026-08-23 from a clean tree. Production synth now requires
+`-c env=production -c availabilityZones=... -c certificateArn=... -c providerBaseUrl=...`
+`-c alarmEmails=... -c imageTag=<digest|sha|version>`; each missing value throws by design
+(D-021, D-022).
 
 | Check       | Command                 | Result                                                                |
 | ----------- | ----------------------- | --------------------------------------------------------------------- |
 | Lint        | `pnpm lint`             | Pass                                                                  |
 | Typecheck   | `pnpm typecheck`        | Pass (app program + CDK program)                                      |
-| Unit        | `pnpm test`             | Pass — 157 tests, 10 files                                            |
-| Integration | `pnpm test:integration` | Pass — 48 tests (DynamoDB Local)                                      |
-| E2E         | `pnpm test:e2e`         | Pass — 10 tests (full pipeline + real HTTP process)                   |
+| Unit        | `pnpm test`             | Pass — 189 tests, 11 files (59 of them CDK)                           |
+| Integration | `pnpm test:integration` | Pass — 49 tests (DynamoDB Local)                                      |
+| E2E         | `pnpm test:e2e`         | Pass — 10 tests; verified stable across three back-to-back runs       |
 | Chaos       | `pnpm test:chaos`       | Pass — 13 tests                                                       |
 | Load        | `pnpm test:load`        | Pass — 200 req @ 20 concurrent, p50 273ms, p95 504ms, 0 sync timeouts |
-| CDK synth   | `pnpm cdk:synth`        | Pass (dev; production passes with `-c availabilityZones=...`)         |
+| CDK synth   | `pnpm cdk:synth`        | Pass (dev; production needs the five context values below)            |
 | CDK diff    | `pnpm cdk:diff`         | **Not run — see B-001**                                               |
 
 ## Required failure scenarios
@@ -115,15 +120,53 @@ All commands run on 2026-08-23 from a clean tree.
   rather than fabricated. To run it: configure credentials, then
   `pnpm cdk:diff -c env=<env>`.
 
-- **B-002 — the two review skills cannot be run by the assistant.**
+- **B-002 — `/reliability-review` cannot be run by the assistant.**
   `.claude/skills/reliability-review` and `.claude/skills/aws-review` both declare
-  `disable-model-invocation: true`, and the tooling explicitly reserves them for user
-  invocation and forbids reproducing their workflow by other means. **A human must run
-  `/reliability-review` and `/aws-review`**, and any CRITICAL/HIGH findings must be fixed
-  and the reviews re-run before this project can be called complete. The
+  `disable-model-invocation: true`. `/aws-review` **has now been run by the user** (see
+  the AWS review section below); `/reliability-review` has not. **A human must run
+  `/reliability-review`**, and must re-run `/aws-review` to confirm the fixes, before this
+  project can be called complete. The
   `dynamodb-state` and `sqs-worker` skills were read directly as reference documents and
   their rules are reflected in the implementation, but that is not a substitute for the
   review passes.
+
+## AWS review — 2026-08-23
+
+`/aws-review` returned **FAIL**: no CRITICAL, 4 HIGH, 11 MEDIUM, 7 LOW. All HIGH and
+MEDIUM findings are fixed; the LOW findings are open. The review must be re-run to confirm.
+
+Fixed (HIGH):
+
+| Finding                                                               | Fix                                 |
+| --------------------------------------------------------------------- | ----------------------------------- |
+| Task SG could not reach the DynamoDB/S3 gateway endpoints or VPC DNS  | D-020, `network-stack.ts`           |
+| Production defaulted to the mutable `latest` image tag                | D-021, `api-stack.ts`, `bin/app.ts` |
+| All alarms notified an SNS topic with zero subscriptions              | D-022, `monitoring-stack.ts`        |
+| `SyncTimeouts` alarm was dimensionless while emission was dimensioned | D-023, `packages/observability`     |
+
+Fixed (MEDIUM): healthy-host / target-5xx / latency / ECS CPU+memory / Lambda-duration
+alarms (`monitoring-stack.ts`); deployment rollback gate and an EventBridge rule on ECS
+deployment state change (D-026); `ALBRequestCountPerTarget` autoscaling (D-025); readiness
+drain window derived from the health-check configuration (D-024); container-level liveness
+check in the task definition; `providerBaseUrl` guarded in production (D-021); ALB deletion
+protection in production; optional Route 53 alias record (D-028); ALB access logs accepted
+as absent (D-027); `linux/arm64` pinned in the Dockerfile runtime stage; the e2e lifecycle
+suite moved off its hardcoded port 8181 onto an ephemeral one.
+
+Still open (LOW, none blocking):
+
+- `ecr:GetAuthorizationToken` and `dynamodb:ListStreams` on `Resource: "*"` are
+  un-scopable by AWS design but carry no in-file justification, which
+  `.claude/rules/infrastructure.md` requires.
+- `enableExecuteCommand: true` in non-production cannot work without `ssmmessages`/`ssm`
+  interface endpoints, which the isolated VPC does not provide.
+- The CloudWatch Monitoring interface endpoint is unused: metrics are EMF-over-logs.
+- Reserved concurrency (40) is 4x the ESM ceiling (10) on both queue consumers.
+- `apps/api/src/routes/` is an empty directory; the routes live in `app.ts`.
+- The reconciler's EventBridge target has no async-invoke failure destination.
+- `deleteForTest()` is a test-only affordance on the production repository class.
+- CDK's `InterfaceVpcEndpoint` defaults to `open: true`, adding a VPC-wide ingress rule
+  alongside the intended security-group reference.
 
 ## Known risks
 
@@ -135,7 +178,10 @@ All commands run on 2026-08-23 from a clean tree.
   in a real environment before production traffic.
 - **R-003** Load numbers come from local emulators in one process. They measure shape and
   catch regressions; they are not capacity predictions. The timeout ladder values remain
-  reasoned defaults until measured against real infrastructure.
+  reasoned defaults until measured against real infrastructure — and so does
+  `requestsPerTargetPerMinute`, which now drives autoscaling (D-025). It is derived from
+  an assumed concurrent-wait capacity per task, not measured, and a real load test must
+  replace it before the scaling policy can be trusted.
 - **R-004** `pnpm` is installed here through a corepack shim in `~/.local/bin`; CI needs
   its own pnpm provisioning step.
 - **R-005** The external provider is simulated. Substituting a real provider requires
@@ -156,7 +202,14 @@ All commands run on 2026-08-23 from a clean tree.
 
 ## Next steps
 
-1. Human runs `/reliability-review` and `/aws-review`; fix CRITICAL/HIGH; re-run.
+1. Human re-runs `/aws-review` to confirm the HIGH/MEDIUM fixes, and runs
+   `/reliability-review` for the first time; fix anything CRITICAL/HIGH.
 2. Configure an AWS account, run `pnpm cdk:diff`, review the plan.
 3. Deploy to `dev` only, with explicit human approval, and validate R-002 items there.
-4. Watch WAF managed-rule counts in dev before trusting blocking mode elsewhere.
+   First deploy must confirm what only a real environment can: that image pull, log
+   delivery, secret fetch and DynamoDB access all succeed with no NAT (D-020).
+4. Load-test against real infrastructure and replace the derived
+   `requestsPerTargetPerMinute` with a measured value (R-003, D-025).
+5. Watch WAF managed-rule counts in dev before trusting blocking mode elsewhere.
+6. Add a build/push pipeline that tags images by commit SHA — production now refuses a
+   mutable tag, so there is no manual path that is also a correct one (D-021).

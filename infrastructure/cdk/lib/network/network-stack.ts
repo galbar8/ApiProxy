@@ -109,12 +109,39 @@ export class NetworkStack extends Stack {
       ec2.Port.tcp(8080),
       "ALB to API",
     );
-    // Egress to AWS service endpoints inside the VPC only.
+    // Egress must cover BOTH kinds of endpoint, which behave differently:
+    //
+    //  - Interface endpoints (ECR API, ECR Docker, Secrets Manager, Logs) are ENIs inside
+    //    the VPC, so VPC-CIDR egress reaches them.
+    //  - Gateway endpoints (DynamoDB, S3) do NOT rewrite the destination address. Traffic
+    //    keeps the service's public IP and is matched by an AWS-managed prefix list, which
+    //    is outside the VPC CIDR. A VPC-CIDR-only rule silently drops every DynamoDB call
+    //    and every ECR image *layer* fetch (layers are served from S3), so tasks never
+    //    reach a running state.
+    //
+    // The prefix list IDs are region-specific and only discoverable through a context
+    // lookup, which is forbidden here (`cdk synth` must work without credentials). These
+    // subnets are PRIVATE_ISOLATED with no internet gateway and no NAT, so 0.0.0.0/0 has
+    // no route out of the VPC: the only destinations this rule can actually reach are the
+    // endpoints themselves. That is the justification for the wide CIDR — the route table,
+    // not the security group, is what confines this traffic.
     this.serviceSecurityGroup.addEgressRule(
-      ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+      ec2.Peer.anyIpv4(),
       ec2.Port.tcp(443),
-      "AWS service endpoints",
+      "AWS service endpoints (gateway endpoints are outside the VPC CIDR; isolated " +
+        "subnets have no route to anything else)",
     );
+
+    // The Amazon-provided resolver lives at VPC CIDR base + 2. Without this the private
+    // DNS names of the interface endpoints cannot be resolved at all, so nothing above
+    // matters.
+    for (const port of [ec2.Port.udp(53), ec2.Port.tcp(53)]) {
+      this.serviceSecurityGroup.addEgressRule(
+        ec2.Peer.ipv4(this.vpc.vpcCidrBlock),
+        port,
+        "VPC DNS resolver",
+      );
+    }
 
     const endpointSecurityGroup = new ec2.SecurityGroup(this, "EndpointSecurityGroup", {
       vpc: this.vpc,

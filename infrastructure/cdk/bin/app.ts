@@ -36,11 +36,42 @@ const env =
         region: process.env["CDK_DEFAULT_REGION"] ?? "us-east-1",
       };
 
+// Defaults are dev conveniences only. Production rejects each of them at synth time —
+// in ApiStack for the image tag, in WorkersStack for the provider, in MonitoringStack for
+// the alarm subscribers — so a forgotten `-c` never reaches a deployment.
 const imageTag = (app.node.tryGetContext("imageTag") ?? "latest") as string;
 const certificateArn = app.node.tryGetContext("certificateArn") as string | undefined;
 const providerBaseUrl =
   (app.node.tryGetContext("providerBaseUrl") as string | undefined) ??
   "https://provider.invalid";
+
+const splitContextList = (value: unknown): string[] =>
+  typeof value === "string"
+    ? value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0)
+    : [];
+
+const alarmEmails = splitContextList(app.node.tryGetContext("alarmEmails"));
+
+// Optional: a stable public name in front of the ALB. Built from supplied attributes, not
+// a hosted-zone lookup, because synth must work without credentials.
+const hostedZoneId = app.node.tryGetContext("hostedZoneId") as string | undefined;
+const zoneName = app.node.tryGetContext("zoneName") as string | undefined;
+const recordName = app.node.tryGetContext("recordName") as string | undefined;
+if (
+  [hostedZoneId, zoneName, recordName].some((value) => value !== undefined) &&
+  [hostedZoneId, zoneName, recordName].some((value) => value === undefined)
+) {
+  throw new Error(
+    "hostedZoneId, zoneName and recordName must be supplied together, or not at all",
+  );
+}
+const domain =
+  hostedZoneId !== undefined && zoneName !== undefined && recordName !== undefined
+    ? { hostedZoneId, zoneName, recordName }
+    : undefined;
 
 const prefix = `Workflow-${envName}`;
 
@@ -77,6 +108,7 @@ const api = new ApiStack(app, `${prefix}-Api`, {
   table: data.table,
   imageTag,
   certificateArn,
+  ...(domain === undefined ? {} : { domain }),
 });
 
 new MonitoringStack(app, `${prefix}-Monitoring`, {
@@ -95,7 +127,9 @@ new MonitoringStack(app, `${prefix}-Monitoring`, {
   ],
   loadBalancer: api.loadBalancer,
   targetGroup: api.targetGroup,
+  service: api.service,
   streamDlq: workers.streamDlq,
+  alarmEmails,
 });
 
 Tags.of(app).add("service", "workflow-service");

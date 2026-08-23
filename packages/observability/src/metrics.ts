@@ -32,6 +32,14 @@ export const createMetrics = (
     dimensions: MetricDimensions,
   ): void => {
     const dimensionNames = Object.keys(dimensions);
+    // Always publish the aggregate series, then the dimensioned breakdown.
+    //
+    // CloudWatch treats each dimension set as a distinct metric: `SyncTimeouts{reason=X}`
+    // and `SyncTimeouts` are not the same series, and an alarm on the latter never sees a
+    // datapoint if only the former is emitted. Publishing both sets means an alarm can be
+    // written against the metric as a whole while the breakdown stays available for
+    // diagnosis — and no call site has to remember which of the two an alarm depends on.
+    const dimensionSets = dimensionNames.length > 0 ? [[], dimensionNames] : [[]];
     logger.info(
       {
         _aws: {
@@ -39,7 +47,7 @@ export const createMetrics = (
           CloudWatchMetrics: [
             {
               Namespace: namespace,
-              Dimensions: dimensionNames.length > 0 ? [dimensionNames] : [[]],
+              Dimensions: dimensionSets,
               Metrics: [{ Name: name, Unit: unit }],
             },
           ],

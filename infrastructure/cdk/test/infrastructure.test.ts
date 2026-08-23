@@ -3,6 +3,7 @@ import { App } from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import {
   environments,
+  healthCheckDetectionWindow,
   requiredVisibilityTimeout,
   type EnvironmentName,
 } from "../lib/environment.js";
@@ -11,6 +12,7 @@ import { DataStack } from "../lib/data/data-stack.js";
 import { MessagingStack } from "../lib/messaging/messaging-stack.js";
 import { WorkersStack } from "../lib/workers/workers-stack.js";
 import { ApiStack } from "../lib/api/api-stack.js";
+import { MonitoringStack } from "../lib/monitoring/monitoring-stack.js";
 
 /**
  * These tests assert the values the *application* depends on.
@@ -24,11 +26,18 @@ const TEST_ENV = { account: "111122223333", region: "us-east-1" };
 
 interface BuildOptions {
   readonly withCertificate?: boolean;
+  readonly imageTag?: string;
+  readonly alarmEmails?: readonly string[];
+  readonly providerBaseUrl?: string;
 }
 
 const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
   const config = environments[envName];
   const withCertificate = options.withCertificate ?? true;
+  // Defaults are what a correct production invocation supplies; individual tests override
+  // one at a time to prove the guard for that value.
+  const imageTag = options.imageTag ?? "1a2b3c4d5e6f7890";
+  const alarmEmails = options.alarmEmails ?? ["oncall@example.com"];
   const app = new App();
   const stackProps = { config, env: TEST_ENV };
   const network = new NetworkStack(app, "Net", {
@@ -42,7 +51,7 @@ const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
     table: data.table,
     startQueue: messaging.startQueue,
     stepQueue: messaging.stepQueue,
-    providerBaseUrl: "https://provider.example",
+    providerBaseUrl: options.providerBaseUrl ?? "https://provider.example.com",
   });
   const api = new ApiStack(app, "Api", {
     ...stackProps,
@@ -50,8 +59,25 @@ const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
     albSecurityGroup: network.albSecurityGroup,
     serviceSecurityGroup: network.serviceSecurityGroup,
     table: data.table,
-    imageTag: "test",
+    imageTag,
     ...(withCertificate ? { certificateArn: TEST_CERT } : {}),
+  });
+  const monitoring = new MonitoringStack(app, "Mon", {
+    ...stackProps,
+    table: data.table,
+    queues: [
+      { name: "Start", queue: messaging.startQueue, dlq: messaging.startDlq },
+      { name: "Step", queue: messaging.stepQueue, dlq: messaging.stepDlq },
+    ],
+    functions: [
+      { name: "WorkerA", fn: workers.workerA },
+      { name: "Finalizer", fn: workers.finalizer },
+    ],
+    loadBalancer: api.loadBalancer,
+    targetGroup: api.targetGroup,
+    service: api.service,
+    streamDlq: workers.streamDlq,
+    alarmEmails,
   });
   return {
     config,
@@ -61,6 +87,7 @@ const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
       messaging: Template.fromStack(messaging),
       workers: Template.fromStack(workers),
       api: Template.fromStack(api),
+      monitoring: Template.fromStack(monitoring),
     },
   };
 };
@@ -460,5 +487,293 @@ describe("network", () => {
     expect(
       () => new NetworkStack(new App(), "Net", { config: environments.production }),
     ).toThrow(/availability zones/);
+  });
+});
+
+describe("egress", () => {
+  const { templates } = buildStacks("production");
+
+  /**
+   * The failure this test exists for: a security group whose only egress rule is the VPC
+   * CIDR looks correct and is fatal. Gateway endpoints (DynamoDB, S3) keep the service's
+   * public address and are matched by an AWS-managed prefix list, so a CIDR-scoped rule
+   * drops every DynamoDB call and every ECR image layer — and the task never starts.
+   * Asserting that the endpoints exist, as the network test below does, cannot catch this.
+   */
+  it("lets tasks reach gateway endpoints, which are outside the VPC CIDR", () => {
+    templates.network.hasResourceProperties("AWS::EC2::SecurityGroup", {
+      GroupDescription: Match.stringLikeRegexp("API tasks"),
+      SecurityGroupEgress: Match.arrayWith([
+        Match.objectLike({ CidrIp: "0.0.0.0/0", FromPort: 443, ToPort: 443 }),
+      ]),
+    });
+  });
+
+  it("lets tasks resolve the private DNS names the endpoints depend on", () => {
+    templates.network.hasResourceProperties("AWS::EC2::SecurityGroup", {
+      GroupDescription: Match.stringLikeRegexp("API tasks"),
+      SecurityGroupEgress: Match.arrayWith([
+        Match.objectLike({ IpProtocol: "udp", FromPort: 53, ToPort: 53 }),
+      ]),
+    });
+  });
+
+  it("keeps the tasks unreachable from anywhere but the load balancer", () => {
+    templates.network.hasResourceProperties("AWS::EC2::SecurityGroup", {
+      GroupDescription: Match.stringLikeRegexp("API tasks"),
+      SecurityGroupIngress: Match.absent(),
+    });
+    templates.api.hasResourceProperties("AWS::ECS::Service", {
+      NetworkConfiguration: Match.objectLike({
+        AwsvpcConfiguration: Match.objectLike({ AssignPublicIp: "DISABLED" }),
+      }),
+    });
+  });
+});
+
+describe("image provenance", () => {
+  it("refuses a mutable production image tag, which would make rollback meaningless", () => {
+    for (const tag of ["latest", "main", "stable"]) {
+      expect(() => buildStacks("production", { imageTag: tag })).toThrow(
+        /immutable imageTag/,
+      );
+    }
+  });
+
+  it("accepts a digest or a version as an immutable reference", () => {
+    expect(() =>
+      buildStacks("production", { imageTag: `sha256:${"a".repeat(64)}` }),
+    ).not.toThrow();
+    expect(() => buildStacks("production", { imageTag: "v1.4.2" })).not.toThrow();
+  });
+
+  it("does not let a production tag be repointed after the fact", () => {
+    const { templates } = buildStacks("production");
+    templates.api.hasResourceProperties("AWS::ECR::Repository", {
+      ImageTagMutability: "IMMUTABLE",
+    });
+  });
+
+  it("leaves dev free to overwrite tags", () => {
+    const { templates } = buildStacks("dev", { imageTag: "latest" });
+    templates.api.hasResourceProperties("AWS::ECR::Repository", {
+      ImageTagMutability: "MUTABLE",
+    });
+  });
+
+  it("refuses a placeholder provider endpoint in production", () => {
+    expect(() =>
+      buildStacks("production", { providerBaseUrl: "https://provider.invalid" }),
+    ).toThrow(/placeholder/);
+    expect(() =>
+      buildStacks("production", { providerBaseUrl: "http://provider.example.com" }),
+    ).toThrow(/https/);
+  });
+});
+
+describe("alarm delivery", () => {
+  /**
+   * Alarms are only a failure mechanism if a human receives them. A topic with no
+   * subscription turns every alarm in the monitoring stack into a metric nobody reads,
+   * which is precisely the outcome the DLQ alarms exist to prevent.
+   */
+  it("subscribes someone to the alarm topic", () => {
+    const { templates } = buildStacks("production", {
+      alarmEmails: ["oncall@example.com", "sre@example.com"],
+    });
+    templates.monitoring.resourceCountIs("AWS::SNS::Subscription", 2);
+    templates.monitoring.hasResourceProperties("AWS::SNS::Subscription", {
+      Protocol: "email",
+      Endpoint: "oncall@example.com",
+    });
+  });
+
+  it("refuses to build production with no alarm subscriber at all", () => {
+    expect(() => buildStacks("production", { alarmEmails: [] })).toThrow(
+      /alarm subscriber/,
+    );
+  });
+
+  it("points every alarm at that topic", () => {
+    const { templates } = buildStacks("production");
+    const alarms = templates.monitoring.findResources(
+      "AWS::CloudWatch::Alarm",
+    ) as Record<string, { Properties: { AlarmActions?: unknown[] } }>;
+    expect(Object.keys(alarms).length).toBeGreaterThan(0);
+    for (const [name, alarm] of Object.entries(alarms)) {
+      expect(alarm.Properties.AlarmActions, `${name} notifies nobody`).toHaveLength(1);
+    }
+  });
+});
+
+describe("alarms cover the failures that matter", () => {
+  const { templates, config } = buildStacks("production");
+
+  /**
+   * `SyncTimeouts` is emitted with a `reason` dimension. CloudWatch treats each dimension
+   * set as a separate metric, so an alarm with no dimensions only ever sees data because
+   * the metrics writer publishes the aggregate series too. If that ever stops, this alarm
+   * sits in INSUFFICIENT_DATA and NOT_BREACHING keeps it silent — the single most
+   * important business alarm, permanently off.
+   */
+  it("alarms on the aggregate sync-deadline metric, which must therefore be emitted", () => {
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "SyncTimeouts",
+      Namespace: "WorkflowService",
+      Dimensions: Match.absent(),
+    });
+  });
+
+  it("notices a total loss of capacity, which the unhealthy-host metric cannot show", () => {
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "HealthyHostCount",
+      ComparisonOperator: "LessThanThreshold",
+      Threshold: config.minCapacity,
+      // With every target gone the metric stops arriving; missing data IS the outage.
+      TreatMissingData: "breaching",
+    });
+  });
+
+  it("separates application 5xx from load-balancer 5xx", () => {
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "HTTPCode_Target_5XX_Count",
+    });
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "HTTPCode_ELB_5XX_Count",
+    });
+  });
+
+  it("alarms when responses escape the synchronous budget", () => {
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "TargetResponseTime",
+      Threshold: config.syncWaitTimeoutMs / 1000,
+    });
+  });
+
+  it("watches task saturation and lambda duration, not just errors", () => {
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "CPUUtilization",
+      Namespace: "AWS/ECS",
+    });
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "MemoryUtilization",
+      Namespace: "AWS/ECS",
+    });
+    templates.monitoring.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: "Duration",
+      Namespace: "AWS/Lambda",
+      Threshold: config.lambdaTimeout.toMilliseconds() * 0.8,
+    });
+  });
+});
+
+describe("deployment safety", () => {
+  const { templates } = buildStacks("production");
+
+  it("rolls back a deployment that starts, then serves errors", () => {
+    templates.api.hasResourceProperties("AWS::ECS::Service", {
+      DeploymentConfiguration: Match.objectLike({
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true },
+        Alarms: Match.objectLike({ Enable: true, Rollback: true }),
+      }),
+    });
+  });
+
+  it("keeps at least the current capacity serving during a rollout", () => {
+    templates.api.hasResourceProperties("AWS::ECS::Service", {
+      DeploymentConfiguration: Match.objectLike({
+        MinimumHealthyPercent: 100,
+        MaximumPercent: 200,
+      }),
+    });
+  });
+
+  /** An automatic rollback is an incident that happened, not one that was avoided. */
+  it("makes a failed deployment visible instead of silently reverting it", () => {
+    templates.monitoring.hasResourceProperties("AWS::Events::Rule", {
+      EventPattern: Match.objectLike({
+        source: ["aws.ecs"],
+        "detail-type": ["ECS Deployment State Change"],
+      }),
+      Targets: Match.arrayWith([Match.objectLike({ Arn: Match.anyValue() })]),
+    });
+  });
+});
+
+describe("drain window", () => {
+  it("keeps serving until the load balancer has certainly stopped routing", () => {
+    for (const config of Object.values(environments)) {
+      // The application flips readiness, then waits. If it stops waiting before the ALB
+      // has observed enough failed checks, requests arriving in the gap hit a closed
+      // listener and become ALB 5xx.
+      expect(config.shutdownReadinessDelayMs).toBeGreaterThan(
+        healthCheckDetectionWindow(config).toMilliseconds(),
+      );
+      // And the whole sequence has to fit inside the SIGKILL deadline.
+      expect(config.stopTimeout.toMilliseconds()).toBeGreaterThan(
+        config.shutdownReadinessDelayMs + config.shutdownDrainMs,
+      );
+    }
+  });
+
+  it("checks liveness at the container level, where ECS actually looks", () => {
+    const { templates } = buildStacks("production");
+    templates.api.hasResourceProperties("AWS::ECS::TaskDefinition", {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          HealthCheck: Match.objectLike({
+            Command: Match.arrayWith([Match.stringLikeRegexp("health/live")]),
+          }),
+        }),
+      ]),
+    });
+  });
+});
+
+describe("capacity", () => {
+  const { templates, config } = buildStacks("production");
+
+  /**
+   * CPU and memory both under-report this service: a task holding 200 open 20-second waits
+   * is nearly idle on each. Request count per target is the only available metric that
+   * tracks the resource that actually runs out.
+   */
+  it("scales on held connections rather than on CPU alone", () => {
+    templates.api.hasResourceProperties("AWS::ApplicationAutoScaling::ScalingPolicy", {
+      TargetTrackingScalingPolicyConfiguration: Match.objectLike({
+        TargetValue: config.requestsPerTargetPerMinute,
+        PredefinedMetricSpecification: Match.objectLike({
+          PredefinedMetricType: "ALBRequestCountPerTarget",
+        }),
+      }),
+    });
+  });
+
+  it("never scales in faster than a task can finish and deregister", () => {
+    const policies = templates.api.findResources(
+      "AWS::ApplicationAutoScaling::ScalingPolicy",
+    ) as Record<
+      string,
+      {
+        Properties: {
+          TargetTrackingScalingPolicyConfiguration: { ScaleInCooldown: number };
+        };
+      }
+    >;
+    for (const [name, policy] of Object.entries(policies)) {
+      const cooldown =
+        policy.Properties.TargetTrackingScalingPolicyConfiguration.ScaleInCooldown;
+      expect(cooldown * 1000, `${name} scales in too fast`).toBeGreaterThan(
+        config.requestTimeoutMs + config.deregistrationDelay.toMilliseconds(),
+      );
+    }
+  });
+
+  it("protects the production front door the way it protects the data", () => {
+    templates.api.hasResourceProperties("AWS::ElasticLoadBalancingV2::LoadBalancer", {
+      LoadBalancerAttributes: Match.arrayWith([
+        { Key: "deletion_protection.enabled", Value: "true" },
+      ]),
+    });
   });
 });

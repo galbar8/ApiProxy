@@ -130,3 +130,119 @@ rule that rejects a legitimate B2B JSON body is a worse outcome than the traffic
 have stopped, so a new environment observes counts before it blocks. `SizeRestrictions_BODY`
 is permanently overridden to count, because payload size is enforced by the service itself
 against a configured limit (ADR-0006) and the two limits must not disagree.
+
+## D-020 — Task egress is opened to `0.0.0.0/0` on 443, deliberately
+
+The API tasks sit in `PRIVATE_ISOLATED` subnets with `natGateways: 0`. Their security
+group previously permitted egress only to the VPC CIDR, which is correct for interface
+endpoints and silently fatal for gateway endpoints: DynamoDB and S3 traffic is _not_
+readdressed into the VPC, it keeps the service's public address and is matched by an
+AWS-managed prefix list. Every DynamoDB call and every ECR image layer (layers are served
+from S3) was therefore dropped, so tasks could never have reached a running state.
+
+The correct destination is the endpoints' prefix lists, but their IDs are region-specific
+and only discoverable through a context lookup, which `.claude/rules/infrastructure.md`
+forbids — `cdk synth` must work without credentials. The rule is therefore written against
+`0.0.0.0/0:443`, and the confinement comes from routing rather than filtering: these
+subnets have no internet gateway and no NAT, so the only destinations reachable through
+that rule are the endpoints themselves.
+
+UDP and TCP 53 to the VPC CIDR are opened alongside it. Without them the private DNS names
+of the interface endpoints cannot be resolved, which makes the rest moot.
+
+## D-021 — Production refuses defaulted deployment inputs
+
+`certificateArn` already threw when missing. Three further inputs now behave the same way
+in production, because each has a default that is safe in dev and wrong in production:
+
+- **`imageTag`** must name an immutable build (a `sha256:` digest, a git SHA or a version),
+  and the production ECR repository is created with `IMMUTABLE` tag mutability. A mutable
+  tag breaks deployment in both directions: pushing a new image produces no CloudFormation
+  change so no rollout starts, and the circuit breaker's rollback restores a task
+  definition pointing at the same moving tag, which is not a rollback.
+- **`providerBaseUrl`** must be a real HTTPS host, not the `https://provider.invalid`
+  placeholder. A placeholder fails loudly rather than corrupting state, but it fails after
+  deployment instead of during synth.
+- **`alarmEmails`** must contain at least one subscriber. See D-022.
+
+## D-022 — Alarms must have a subscriber, enforced at synth time
+
+The monitoring stack created an SNS topic and attached it to every alarm, and nothing ever
+subscribed to that topic. Thirty correctly-configured alarms — DLQ-not-empty, queue
+backlog, DynamoDB throttling, unhealthy targets — resolved to a topic no operator received,
+which is exactly the failure mode INV-45 exists to prevent.
+
+Subscription is now a synth-time requirement in production rather than an undocumented
+console step, and a CDK test asserts both that a subscription exists and that every alarm
+in the stack has an alarm action.
+
+## D-023 — Metrics publish an aggregate series alongside every dimensioned one
+
+CloudWatch treats each EMF dimension set as a separate metric. `SyncTimeouts{reason=…}`
+and `SyncTimeouts` are different series, so an alarm on the undimensioned name never
+receives a datapoint when only the dimensioned set is emitted — it sits in
+`INSUFFICIENT_DATA` permanently, and `treatMissingData: NOT_BREACHING` keeps it silent.
+The sync-deadline alarm, the most important business alarm in a sync-over-async service,
+was dead for this reason, and `WorkflowFailureRate` under-counted for the same one: it only
+ever saw the failures observed inside the synchronous window.
+
+`createMetrics` now emits `Dimensions: [[], [...names]]`, so the aggregate exists for
+alarms and the breakdown remains for diagnosis. No call site has to know which of the two
+an alarm depends on.
+
+## D-024 — The readiness drain window is derived from the health-check configuration
+
+The application flips readiness, waits, then closes its listener. That wait must outlast
+the time the ALB needs to notice — `interval x (unhealthyThreshold + 1) + timeout` — or
+requests arriving in the gap hit a closed listener and become ALB 5xx. The previous values
+were inverted: a 5s wait against a ~20s detection window, with a code comment asserting the
+opposite.
+
+The health check is now 5s/3s with a threshold of 2 (an 18s window) and the readiness delay
+is 20s. `healthCheckDetectionWindow()` computes the relationship, `ApiStack` throws if it is
+violated, and a CDK test asserts it for every environment together with
+`stopTimeout > readinessDelay + drain`. The application default in `packages/config` stays
+at 5s: a local process has no load balancer to wait for.
+
+## D-025 — Autoscaling tracks held connections, not CPU or memory
+
+This service holds a connection open for the whole synchronous wait, so the resource that
+runs out first is concurrent connections per task. CPU and memory both under-report it — a
+task saturated with 20-second waits is nearly idle on each — and the previous memory policy
+was no better a proxy than the CPU one it sat beside.
+
+`ALBRequestCountPerTarget` is now the primary policy, with CPU retained as a secondary
+floor for load shapes the request count cannot see. `requestsPerTargetPerMinute` is derived
+(concurrent waits x 60 / wait seconds), **not measured**; R-003 must replace it with a
+load-tested value. Scale-in cooldown is 300s so a task removed from the group can always
+finish its longest request and serve out its deregistration delay.
+
+## D-026 — Deployment failure is made visible, not just automatic
+
+The circuit breaker only observes tasks that fail to _start_. Two alarms in the API stack —
+target 5xx and unhealthy targets — now gate the rollout through `deploymentAlarms`, covering
+the worse case of tasks that start happily and then serve errors. Their names are static
+string literals rather than `alarm.alarmName`, because the latter resolves to a
+CloudFormation `Ref` and creates a deployment-time circular dependency.
+
+An automatic rollback is an incident that already happened, not one that was avoided, so an
+EventBridge rule on `ECS Deployment State Change` (scoped to this service's ARN) publishes
+`SERVICE_DEPLOYMENT_FAILED` to the alarm topic.
+
+## D-027 — No ALB access logs; S3 remains excluded
+
+ALB access logging requires an S3 bucket, which ADR-0006 forbids. The trade-off is accepted
+rather than implicit: per-request edge forensics are lost, and the compensating evidence is
+the structured application log, which carries `requestId` for every request that reached a
+task. The gap is real for requests the ALB rejected before reaching a target — WAF blocks,
+TLS failures, 5xx generated by the load balancer itself — which are visible only as metrics.
+Revisit if an incident ever needs per-request edge attribution; that would be sufficient
+grounds to supersede ADR-0006 for this one purpose.
+
+## D-028 — Public DNS is optional and lookup-free
+
+`hostedZoneId`, `zoneName` and `recordName` may be supplied together to create an alias
+record in front of the ALB, so B2B callers reach a stable name and the load balancer can be
+replaced without every client reconfiguring. The zone is built from
+`HostedZone.fromHostedZoneAttributes`, never `fromLookup`, so synth still needs no
+credentials. Supplying some but not all three is a synth-time error.
