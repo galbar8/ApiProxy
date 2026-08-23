@@ -1,0 +1,13 @@
+{
+  "app": "tsx infrastructure/cdk/bin/app.ts",
+  "output": "cdk.out",
+  "watch": { "exclude": ["**/node_modules/**", "**/dist/**", "cdk.out/**"] },
+  "context": {
+    "env": "dev",
+    "@aws-cdk/core:defaultCrossStackReferences": "strong",
+    "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:target-partitions": ["aws"]
+  }
+}

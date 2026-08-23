@@ -1,0 +1,31 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@workflow/contracts": ["packages/contracts/src/index.ts"],
+      "@workflow/config": ["packages/config/src/index.ts"],
+      "@workflow/observability": ["packages/observability/src/index.ts"],
+      "@workflow/persistence": ["packages/persistence/src/index.ts"],
+      "@workflow/messaging": ["packages/messaging/src/index.ts"],
+      "@workflow/idempotency": ["packages/idempotency/src/index.ts"],
+      "@workflow/testing": ["packages/testing/src/index.ts"],
+      "@workflow/api": ["apps/api/src/index.ts"],
+      "@workflow/worker-a": ["apps/worker-a/src/index.ts"],
+      "@workflow/finalizer": ["apps/finalizer/src/index.ts"],
+      "@workflow/outbox-publisher": ["apps/outbox-publisher/src/index.ts"],
+      "@workflow/reconciler": ["apps/reconciler/src/index.ts"],
+      "@workflow/fake-provider": ["apps/fake-provider/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "apps/*/src/**/*.ts",
+    "tests/**/*.ts",
+    "scripts/**/*.ts",
+    "*.config.ts",
+    "*.config.mts"
+  ],
+  "exclude": ["**/node_modules", "**/dist", "**/cdk.out"]
+}

@@ -141,3 +141,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# CDK synthesis output and cached context lookups
+cdk.out/
+cdk.context.json

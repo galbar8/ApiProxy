@@ -1,0 +1,26 @@
+{
+  "name": "@workflow/testing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.716.0",
+    "@aws-sdk/lib-dynamodb": "^3.716.0",
+    "@aws-sdk/client-sqs": "^3.716.0",
+    "@workflow/contracts": "workspace:*",
+    "@workflow/config": "workspace:*",
+    "@workflow/persistence": "workspace:*",
+    "@workflow/observability": "workspace:*",
+    "@workflow/idempotency": "workspace:*",
+    "@workflow/messaging": "workspace:*",
+    "@aws-sdk/client-dynamodb-streams": "^3.716.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.146"
+  }
+}
