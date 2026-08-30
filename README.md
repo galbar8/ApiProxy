@@ -18,6 +18,7 @@ Axios ─► ALB ─► ECS/Fargate API ─► DynamoDB ─(stream)─► outbox
 | Document                                         | What it is                                    |
 | ------------------------------------------------ | --------------------------------------------- |
 | [`CLAUDE.md`](CLAUDE.md)                         | Project rules                                 |
+| [`docs/API.md`](docs/API.md)                     | How to call the API, with examples            |
 | [`docs/architecture.md`](docs/architecture.md)   | How the system fits together and why          |
 | [`docs/invariants.md`](docs/invariants.md)       | The correctness rules, each with an ID        |
 | [`docs/state-machine.md`](docs/state-machine.md) | Legal states and transitions                  |
@@ -85,19 +86,32 @@ Both terminal outcomes return `200` with an explicit `status` field — a busine
 is a successful call with a negative answer, not a transport error. See
 [ADR-0005](docs/adr/0005-synchronous-response-semantics.md).
 
+**[`docs/API.md`](docs/API.md) is the caller's guide** — request and response shapes, the
+idempotency rules, every error code, and a complete Axios client.
+
 ## Deployment
 
 **Nothing has been deployed.** The stacks synthesize; they have never been applied to an
 AWS account.
 
+**[`DEPLOYMENT.md`](DEPLOYMENT.md) is the step-by-step guide** — prerequisites, the four
+things to fix before a first deploy, every `-c` context value, the deploy order, populating
+the API-key secret, shipping a new version, and what the alarms mean.
+
+The short version:
+
 ```bash
 pnpm cdk:synth                       # dev, fully offline
 pnpm cdk:synth -c env=production \
+  -c imageTag=$(git rev-parse HEAD) \
   -c certificateArn=<acm-arn> \
+  -c providerBaseUrl=https://provider.example.com \
+  -c alarmEmails=oncall@example.com \
   -c availabilityZones=us-east-1a,us-east-1b,us-east-1c
 ```
 
-Before any deploy: build and push the API image to the stack's ECR repository, then pass
-its tag with `-c imageTag=<tag>`, and populate the API key secret out of band. Production
-refuses to synthesize without a certificate or without explicit availability zones — an
-environment-agnostic stack would silently drop to two AZs.
+Before any deploy: build and push the arm64 API image to the stack's ECR repository, then
+pass its tag with `-c imageTag=<git-sha>`, and populate the API key secret out of band.
+Production refuses to synthesize without a certificate, a real provider URL, an alarm
+subscriber, an immutable image tag, or explicit availability zones — an environment-agnostic
+stack would silently drop to two AZs.
