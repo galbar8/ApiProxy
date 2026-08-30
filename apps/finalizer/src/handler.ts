@@ -80,11 +80,25 @@ export const createFinalizerHandler = (deps: FinalizerDependencies) => {
         stepId: "FINALIZE",
         error: workflowError,
       });
-      deps.metrics.count(METRICS.workflowFailed, 1, { reason: "declined" });
-      deps.logger.info(
-        { outcome: failed.outcome },
-        "workflow failed: provider declined",
-      );
+
+      if (
+        failed.outcome === "ALREADY_TERMINAL" &&
+        failed.workflow.status !== "FAILED"
+      ) {
+        // Someone completed this workflow while the provider was declining it. Counting
+        // that as a routine failure would hide a genuine contradiction.
+        deps.metrics.count(METRICS.terminalDivergence);
+        deps.logger.error(
+          { storedStatus: failed.workflow.status, intendedStatus: "FAILED" },
+          "terminal divergence: workflow is COMPLETED but the provider declined",
+        );
+      } else {
+        deps.metrics.count(METRICS.workflowFailed, 1, { reason: "declined" });
+        deps.logger.info(
+          { outcome: failed.outcome },
+          "workflow failed: provider declined",
+        );
+      }
       return "DONE";
     }
 
@@ -111,12 +125,29 @@ export const createFinalizerHandler = (deps: FinalizerDependencies) => {
     });
 
     if (completed.outcome === "ALREADY_TERMINAL") {
-      // Another attempt got there first. The stored outcome wins (INV-21).
-      deps.metrics.count(METRICS.terminalConflict);
-      deps.logger.info(
-        { storedStatus: completed.workflow.status },
-        "terminal write lost the race; existing outcome preserved",
-      );
+      // Another attempt got there first. The stored outcome wins either way (INV-21), but
+      // *which* outcome it is decides whether this is routine or an incident. A duplicate
+      // delivery of the same work lands on the same conclusion and is uninteresting. A
+      // stored FAILED under an intended COMPLETED means two workers looked at one workflow
+      // and disagreed, and no counter that merges the two cases can say so
+      // (docs/state-machine.md, "Enforcement" step 3).
+      if (completed.workflow.status === "COMPLETED") {
+        deps.metrics.count(METRICS.terminalConflict);
+        deps.logger.info(
+          { storedStatus: completed.workflow.status },
+          "terminal write lost the race to the same outcome; stored result preserved",
+        );
+      } else {
+        deps.metrics.count(METRICS.terminalDivergence);
+        deps.logger.error(
+          {
+            storedStatus: completed.workflow.status,
+            intendedStatus: "COMPLETED",
+            storedErrorCode: completed.workflow.error?.code,
+          },
+          "terminal divergence: the stored outcome contradicts this worker's conclusion",
+        );
+      }
     } else {
       deps.metrics.count(METRICS.workflowCompleted);
     }

@@ -1,6 +1,11 @@
 import { loadConfig, type Config } from "@workflow/config";
 import { systemClock, type Clock } from "@workflow/contracts";
-import { createLogger, createMetrics } from "@workflow/observability";
+import {
+  METRICS,
+  createLogger,
+  createMetrics,
+  serializeError,
+} from "@workflow/observability";
 import {
   DynamoWorkflowWaiter,
   WorkflowRepository,
@@ -31,6 +36,8 @@ export const buildDependencies = (
     environment: config.env,
   });
 
+  const metrics = createMetrics(logger);
+
   const documentClient = createDocumentClient({
     region: config.region,
     endpoint: config.persistence.endpoint,
@@ -59,6 +66,15 @@ export const buildDependencies = (
       clock,
       cacheTtlMs: config.auth.cacheTtlMs,
       negativeCacheMs: config.auth.negativeCacheMs,
+      onStaleServed: (error) => {
+        // Authentication still works; revocation has stopped propagating. That is worth
+        // an alarm, not a 500 for every caller.
+        metrics.count(METRICS.credentialRefreshFailed);
+        logger.error(
+          { err: serializeError(error) },
+          "api key refresh failed; serving the cached document until the next attempt",
+        );
+      },
     });
   } else {
     // loadConfig already enforces this; failing here too means a hand-built Config
@@ -69,7 +85,7 @@ export const buildDependencies = (
   return {
     config,
     logger,
-    metrics: createMetrics(logger),
+    metrics,
     repository,
     waiter: new DynamoWorkflowWaiter({
       repository,

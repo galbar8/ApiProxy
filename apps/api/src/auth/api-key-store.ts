@@ -62,6 +62,11 @@ export interface SecretsApiKeyStoreOptions {
   readonly clock: Clock;
   readonly cacheTtlMs: number;
   readonly negativeCacheMs: number;
+  /**
+   * Called when a refresh fails but a previously loaded document is still usable, so the
+   * store keeps serving. The caller decides how loudly to say so.
+   */
+  readonly onStaleServed?: (error: unknown) => void;
 }
 
 /**
@@ -74,12 +79,22 @@ export interface SecretsApiKeyStoreOptions {
  * Revocation latency equals the cache TTL. A cache miss triggers at most one refresh per
  * `negativeCacheMs`, so a flood of invalid keys cannot turn into a flood of Secrets
  * Manager calls.
+ *
+ * A refresh that fails is not an outage. Once a document has loaded successfully, the
+ * cached index keeps answering and the next attempt is deferred by `negativeCacheMs`;
+ * otherwise a transient Secrets Manager blip would 500 every request *and* have each of
+ * them retry, turning a dependency wobble into a self-inflicted retry storm. The cost is
+ * stated plainly: while refreshes are failing, revocations stop propagating, which is why
+ * `onStaleServed` exists. A store that has never loaded a document has nothing to serve
+ * and still throws.
  */
 export class SecretsApiKeyStore implements ApiKeyStore {
   readonly #options: SecretsApiKeyStoreOptions;
   #index = new Map<string, ResolvedCaller>();
   #loadedAt = 0;
+  #loadedEver = false;
   #lastMissRefreshAt = 0;
+  #nextRefreshAllowedAt = 0;
   #inFlight: Promise<void> | undefined;
 
   constructor(options: SecretsApiKeyStoreOptions) {
@@ -89,7 +104,7 @@ export class SecretsApiKeyStore implements ApiKeyStore {
   async resolve(presentedKey: string): Promise<ResolvedCaller | undefined> {
     const now = this.#options.clock.now();
     if (now - this.#loadedAt >= this.#options.cacheTtlMs) {
-      await this.#refresh();
+      await this.#refreshOrServeStale(now);
     }
 
     const digest = hashKey(presentedKey);
@@ -100,10 +115,26 @@ export class SecretsApiKeyStore implements ApiKeyStore {
     // cooldown so invalid keys cannot amplify into Secrets Manager load.
     if (now - this.#lastMissRefreshAt >= this.#options.negativeCacheMs) {
       this.#lastMissRefreshAt = now;
-      await this.#refresh();
+      await this.#refreshOrServeStale(now);
       return this.#lookup(digest);
     }
     return undefined;
+  }
+
+  /**
+   * Refreshes unless a recent failure put attempts in cooldown. Rethrows only when there
+   * is no cached document to fall back to — an API that cannot authenticate anyone should
+   * fail loudly rather than reject every caller as unauthorized.
+   */
+  async #refreshOrServeStale(now: number): Promise<void> {
+    if (this.#loadedEver && now < this.#nextRefreshAllowedAt) return;
+    try {
+      await this.#refresh();
+    } catch (error) {
+      if (!this.#loadedEver) throw error;
+      this.#nextRefreshAllowedAt = now + this.#options.negativeCacheMs;
+      this.#options.onStaleServed?.(error);
+    }
   }
 
   #lookup(digest: string): ResolvedCaller | undefined {
@@ -132,8 +163,13 @@ export class SecretsApiKeyStore implements ApiKeyStore {
         "api key secret has no string value",
       );
     }
-    this.#index = buildIndex(response.SecretString, this.#options.clock.now());
+    // Built before either field moves, so a document that fails validation leaves the
+    // previous index in place rather than blanking it.
+    const rebuilt = buildIndex(response.SecretString, this.#options.clock.now());
+    this.#index = rebuilt;
     this.#loadedAt = this.#options.clock.now();
+    this.#loadedEver = true;
+    this.#nextRefreshAllowedAt = 0;
   }
 }
 

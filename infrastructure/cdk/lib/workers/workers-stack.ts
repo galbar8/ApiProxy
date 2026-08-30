@@ -133,9 +133,9 @@ export class WorkersStack extends Stack {
       START_QUEUE_URL: startQueue.queueUrl,
       STEP_QUEUE_URL: stepQueue.queueUrl,
       OUTBOX_STALE_AFTER_MS: String(config.outboxStaleAfterMs),
-      // Reporting only: failing a workflow because a deadline passed would assert a
-      // business outcome nobody observed (INV-51).
-      RECONCILE_FAIL_STALE_WORKFLOWS: "false",
+      // The reconciler reports stale workflows and never judges them. There is no
+      // environment variable that changes this, because failing a workflow for missing a
+      // deadline would assert a business outcome nobody observed (INV-51, D-029).
     });
 
     // ---- IAM: enumerated actions, table-scoped resources ---------------------

@@ -32,19 +32,15 @@ describe("configSchema defaults", () => {
     expect(config.http.port).toBe(9090);
   });
 
-  it("treats 'false' as false rather than as a truthy string", () => {
-    expect(
-      configSchema.parse({ RECONCILE_FAIL_STALE_WORKFLOWS: "false" }).reconciler
-        .failStaleWorkflows,
-    ).toBe(false);
-    expect(
-      configSchema.parse({ RECONCILE_FAIL_STALE_WORKFLOWS: "true" }).reconciler
-        .failStaleWorkflows,
-    ).toBe(true);
-  });
-
-  it("does not auto-fail stale workflows by default (INV-51)", () => {
-    expect(configSchema.parse({}).reconciler.failStaleWorkflows).toBe(false);
+  it("offers no setting that turns a passed deadline into a failure (INV-51, D-029)", () => {
+    // The switch that once did this is gone, not merely defaulted to off. Parsing ignores
+    // unknown keys, so the assertion is on the parsed output: even when a deployment sets
+    // the old variable, no reconciler setting exists for it to reach.
+    const config = configSchema.parse({ RECONCILE_FAIL_STALE_WORKFLOWS: "true" });
+    expect(Object.keys(config.reconciler).sort()).toEqual([
+      "outboxStaleAfterMs",
+      "pageSize",
+    ]);
   });
 });
 

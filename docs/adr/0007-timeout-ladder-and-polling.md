@@ -33,6 +33,14 @@ controlled `202` before the caller gives up. Every other value derives its safet
 from it, and `config.ts` **validates the ordering at startup** — a ladder that is not
 strictly increasing is a fatal configuration error, not a runtime surprise.
 
+`HTTP_REQUEST_TIMEOUT_MS` is enforced by an `onRequest` hook in `app.ts`, **not** by
+Fastify's `requestTimeout` option. That option bounds _receiving_ a request from the client
+and never bounds handler duration, so on its own it leaves this rung validated but
+unenforced (D-031). Enforcement matters because the rung exists so the ALB is never the
+component that answers a B2B caller: without it, a handler stuck on a slow dependency runs
+until the ALB idle timeout and the caller gets an ALB-generated `504` instead of our
+controlled `503`.
+
 `HTTP_KEEP_ALIVE_TIMEOUT_MS` exceeding the ALB idle timeout is the documented fix for the
 ALB/Node 502 race: the ALB must be the side that closes an idle keep-alive connection.
 

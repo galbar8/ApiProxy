@@ -50,8 +50,19 @@ export interface AppDependencies {
 
 const BEARER_PREFIX = "ApiKey ";
 
+/**
+ * Every response in this file goes through here.
+ *
+ * The request-budget timer can answer a caller while a handler is still awaiting DynamoDB,
+ * so two code paths can reach for the same reply. Whichever arrives first wins and the
+ * loser is dropped rather than throwing `FST_ERR_REP_ALREADY_SENT`. Dropping is safe: the
+ * loser is only ever the slower duplicate of an answer the caller already has.
+ */
+const sendOnce = (reply: FastifyReply, status: number, body: unknown): FastifyReply =>
+  reply.sent ? reply : reply.code(status).send(body);
+
 const sendProblem = (reply: FastifyReply, problem: HttpProblem): FastifyReply =>
-  reply.code(problem.status).send({
+  sendOnce(reply, problem.status, {
     code: problem.code,
     message: problem.message,
     ...(problem.details === undefined ? {} : { details: problem.details }),
@@ -129,6 +140,51 @@ export const buildApp = (deps: AppDependencies) => {
     return await reply
       .code(ready ? 200 : 503)
       .send({ status: ready ? "ready" : "draining", state: lifecycle.state });
+  });
+
+  // ---- Request budget -----------------------------------------------------
+  /**
+   * The middle rung of the timeout ladder (ADR-0007, D-031).
+   *
+   * Fastify's `requestTimeout` option bounds *receiving* a request from the client, not
+   * handling one, so on its own it never enforces this rung: a handler stuck on a slow
+   * DynamoDB call runs until the ALB gives up at its idle timeout and the caller gets an
+   * ALB-generated 504 instead of our controlled answer. This timer closes that gap.
+   *
+   * Under the normal path it never fires — the waiter already returns a 202 at the
+   * synchronous deadline, comfortably inside the budget. It exists for the pathological
+   * case: throttling with SDK retries underneath `createWorkflow`, or a slow credential
+   * refresh.
+   *
+   * Firing says nothing about the workflow. No state is touched, the in-flight work keeps
+   * running, and the caller retries with the same idempotency key to collect the result
+   * (INV-51).
+   */
+  app.addHook("onRequest", async (request, reply) => {
+    if (!request.url.startsWith("/v1/")) return;
+
+    // Cancelled as soon as the response is done, so the budget never outlives its request.
+    const settled = new AbortController();
+    reply.raw.on("close", () => {
+      settled.abort();
+    });
+
+    void clock.sleep(config.http.requestTimeoutMs, settled.signal).then(
+      () => {
+        if (reply.sent) return;
+        metrics.count(METRICS.requestBudgetExceeded, 1, {
+          route: request.routeOptions.url ?? "unknown",
+        });
+        request.log.warn(
+          { budgetMs: config.http.requestTimeoutMs },
+          "request budget exhausted; answering before the load balancer would",
+        );
+        sendProblem(reply.header("retry-after", "1"), PROBLEMS.budgetExhausted());
+      },
+      () => {
+        // AbortError: the response finished first, which is the ordinary case.
+      },
+    );
   });
 
   // ---- Authentication -----------------------------------------------------
@@ -239,7 +295,7 @@ export const buildApp = (deps: AppDependencies) => {
             route: "process",
             outcome: workflow.status,
           });
-          return await reply.code(200).send(terminalBody(workflow));
+          return await sendOnce(reply, 200, terminalBody(workflow));
         }
       }
 
@@ -263,7 +319,7 @@ export const buildApp = (deps: AppDependencies) => {
             ? METRICS.workflowCompleted
             : METRICS.workflowFailed,
         );
-        return await reply.code(200).send(terminalBody(result.workflow));
+        return await sendOnce(reply, 200, terminalBody(result.workflow));
       }
 
       // TIMED_OUT, ABORTED and MISSING all mean the same thing to the caller: no answer
@@ -279,15 +335,12 @@ export const buildApp = (deps: AppDependencies) => {
         "synchronous deadline reached; workflow continues",
       );
 
-      return await reply
-        .code(202)
-        .header("retry-after", "1")
-        .send({
-          requestId: effectiveRequestId,
-          status: "PROCESSING",
-          pollUrl: `${config.http.publicBaseUrl}/v1/process/${effectiveRequestId}`,
-          retryAfterSeconds: 1,
-        });
+      return await sendOnce(reply.header("retry-after", "1"), 202, {
+        requestId: effectiveRequestId,
+        status: "PROCESSING",
+        pollUrl: `${config.http.publicBaseUrl}/v1/process/${effectiveRequestId}`,
+        retryAfterSeconds: 1,
+      });
     });
   });
 
@@ -316,9 +369,9 @@ export const buildApp = (deps: AppDependencies) => {
       metrics.count(METRICS.workflowRecovered, 1, { status: workflow.status });
 
       if (isTerminal(workflow.status)) {
-        return await reply.code(200).send(terminalBody(workflow));
+        return await sendOnce(reply, 200, terminalBody(workflow));
       }
-      return await reply.code(200).send({
+      return await sendOnce(reply, 200, {
         requestId: workflow.requestId,
         status: "PROCESSING",
         pollUrl: `${config.http.publicBaseUrl}/v1/process/${workflow.requestId}`,

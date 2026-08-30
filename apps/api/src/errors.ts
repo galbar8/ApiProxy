@@ -47,6 +47,15 @@ export const PROBLEMS = {
     code: ERROR_CODES.SERVICE_DRAINING,
     message: "service is draining; retry against another task",
   }),
+  budgetExhausted: (): HttpProblem => ({
+    status: 503,
+    code: ERROR_CODES.REQUEST_BUDGET_EXCEEDED,
+    // Says nothing about the workflow, deliberately. The request ran out of server-side
+    // budget; the work may already have succeeded, so the caller retries with the same
+    // idempotency key and gets the stored answer rather than a second operation.
+    message:
+      "request exceeded its server-side budget; retry with the same idempotency key",
+  }),
   internal: (): HttpProblem => ({
     status: 500,
     code: ERROR_CODES.INTERNAL_ERROR,

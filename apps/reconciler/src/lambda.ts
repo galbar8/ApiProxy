@@ -40,5 +40,4 @@ export const handler = createReconcilerHandler({
   metrics: createMetrics(logger),
   outboxStaleAfterMs: config.reconciler.outboxStaleAfterMs,
   pageSize: config.reconciler.pageSize,
-  failStaleWorkflows: config.reconciler.failStaleWorkflows,
 });

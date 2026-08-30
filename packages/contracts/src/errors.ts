@@ -12,6 +12,11 @@ export const ERROR_CODES = {
   IDEMPOTENCY_KEY_CONFLICT: "IDEMPOTENCY_KEY_CONFLICT",
   NOT_FOUND: "NOT_FOUND",
   SERVICE_DRAINING: "SERVICE_DRAINING",
+  /**
+   * The server-side request budget expired. It describes the HTTP attempt only: the
+   * workflow is untouched and may still succeed (INV-51).
+   */
+  REQUEST_BUDGET_EXCEEDED: "REQUEST_BUDGET_EXCEEDED",
   INTERNAL_ERROR: "INTERNAL_ERROR",
 
   // Workflow-facing

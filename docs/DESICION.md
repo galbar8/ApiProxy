@@ -25,6 +25,21 @@ decision is marked `Superseded` and a new entry is added below it.
 | D-017 | The DynamoDB Streams consumer has its own failure destination                                                                                    | Accepted | 2026-08-23 | Below                                                    |
 | D-018 | `exactOptionalPropertyTypes` is relaxed for CDK code only                                                                                        | Accepted | 2026-08-23 | Below                                                    |
 | D-019 | WAF on the ALB: per-IP rate limit always blocking, managed rules counting in dev                                                                 | Accepted | 2026-08-23 | Below                                                    |
+| D-020 | Task egress is opened to `0.0.0.0/0` on 443, deliberately                                                                                        | Accepted | 2026-08-23 | Below                                                    |
+| D-021 | Production refuses defaulted deployment inputs                                                                                                   | Accepted | 2026-08-23 | Below                                                    |
+| D-022 | Alarms must have a subscriber, enforced at synth time                                                                                            | Accepted | 2026-08-23 | Below                                                    |
+| D-023 | Metrics publish an aggregate series alongside every dimensioned one                                                                              | Accepted | 2026-08-23 | Below                                                    |
+| D-024 | The readiness drain window is derived from the health-check configuration                                                                        | Accepted | 2026-08-23 | Below                                                    |
+| D-025 | Autoscaling tracks held connections, not CPU or memory                                                                                           | Accepted | 2026-08-23 | Below                                                    |
+| D-026 | Deployment failure is made visible, not just automatic                                                                                           | Accepted | 2026-08-23 | Below                                                    |
+| D-027 | No ALB access logs; S3 remains excluded                                                                                                          | Accepted | 2026-08-23 | Below                                                    |
+| D-028 | Public DNS is optional and lookup-free                                                                                                           | Accepted | 2026-08-23 | Below                                                    |
+| D-029 | A passed deadline is never a business failure, and nothing can configure it to be                                                                | Accepted | 2026-08-24 | Below                                                    |
+| D-030 | The terminal step write backfills a schema-valid item                                                                                            | Accepted | 2026-08-24 | Below                                                    |
+| D-031 | The request budget is enforced, not merely configured                                                                                            | Accepted | 2026-08-24 | Below                                                    |
+| D-032 | A failed credential refresh serves the cached document                                                                                           | Accepted | 2026-08-24 | Below                                                    |
+| D-033 | Terminal divergence is a distinct, alarmed signal                                                                                                | Accepted | 2026-08-24 | Below                                                    |
+| D-034 | `beginStep` reports the status it replaced                                                                                                       | Accepted | 2026-08-24 | Below                                                    |
 
 ## D-010 — Two-step worker chain
 
@@ -246,3 +261,157 @@ record in front of the ALB, so B2B callers reach a stable name and the load bala
 replaced without every client reconfiguring. The zone is built from
 `HostedZone.fromHostedZoneAttributes`, never `fromLookup`, so synth still needs no
 credentials. Supplying some but not all three is a synth-time error.
+
+## D-029 — A passed deadline is never a business failure, and nothing can configure it to be
+
+_Accepted 2026-08-24. Supersedes nothing; removes a capability that should not have existed._
+
+The reconciler carried a `RECONCILE_FAIL_STALE_WORKFLOWS` flag which, when true, wrote a
+terminal `FAILED` with code `BUSINESS_DEADLINE_EXCEEDED` to every workflow still
+`PROCESSING` past `businessDeadlineAt`. The flag defaulted to off and CDK hardwired it to
+`"false"`, but it was a first-class supported mode, reachable by editing one Lambda
+environment variable in the console.
+
+It is now deleted outright — the env var, the config field, the dependency, the branch and
+the CDK entry — rather than left off by default, because:
+
+- It contradicts INV-51 directly. A deadline that passed says the work is slow, not that it
+  failed. Nobody observed a business outcome.
+- It is at its most destructive exactly when it is least correct. A `FINALIZE` step in
+  `UNKNOWN_EXTERNAL_STATE` means the provider may already have executed the operation. The
+  flag would report a definitive failure to the caller for work that may have succeeded.
+- Its write erased the evidence. The step update in `#writeTerminal` overwrote the
+  `UNKNOWN_EXTERNAL_STATE` marker that ADR-0008 and INV-62 name as the mechanism forcing
+  reconciliation, and a terminal write is unrewritable (INV-21), so no later sweep could
+  correct it.
+- It had no test. It was plumbed into the harness and never exercised, so the one path in
+  the system that could manufacture a terminal state from a clock had zero failure-path
+  coverage.
+
+The rejected alternative was to keep it behind an ADR superseding INV-51, gated on the
+absence of any `UNKNOWN_EXTERNAL_STATE` step. That buys a capability nobody asked for at the
+cost of a permanent exception to a core invariant. Stale workflows remain fully visible: the
+`StaleWorkflow` metric, a warning log carrying the affected `requestId`s, and the alarms in
+the monitoring stack. Only a worker that actually knows an outcome may write a terminal
+state.
+
+A regression test in `packages/config/src/config.test.ts` asserts that setting the old
+variable reaches no reconciler setting at all, so the flag cannot return by accident.
+
+## D-030 — The terminal step write backfills a schema-valid item
+
+_Accepted 2026-08-24._
+
+`#writeTerminal` updates the step item alongside the workflow item in one
+`TransactWriteItems`. That update set only `status` and `updatedAt`. Because `UpdateItem`
+upserts, failing a step that was never claimed — which the finalizer does when stored input
+fails validation, before `beginStep` runs — created a `STEP#` item carrying neither
+`requestId`, `stepId`, `attempt` nor `createdAt`, and therefore failing `stepRecordSchema`
+on every later read.
+
+A `ConditionExpression` was considered and rejected: the step shares a transaction with the
+workflow's terminal write, so a failed condition would abort both and strand the workflow in
+`PROCESSING` — a strictly worse outcome than the latent decode error it would prevent. The
+update instead backfills the identifying fields, using `if_not_exists` for everything a real
+claim owns, so `createdAt`, `attempt`, the TTL and `externalRef` survive untouched. Two
+integration tests cover both directions: the unclaimed step now reads back cleanly, and a
+claimed step keeps the provider identity a retry would reuse (INV-63).
+
+## D-031 — The request budget is enforced, not merely configured
+
+_Accepted 2026-08-24._
+
+`HTTP_REQUEST_TIMEOUT_MS` (22s) is the middle rung of the ADR-0007 ladder: business wait
+(20s) < request budget (22s) < ALB idle (30s) < client (35s). It was passed to Fastify as
+`requestTimeout`, which bounds _receiving_ a request from the client, not handling one. The
+rung was therefore validated at startup by `config.superRefine` and never enforced at
+runtime: a handler stuck on a slow DynamoDB call ran until the ALB gave up, and the caller
+got an ALB-generated 504 instead of our controlled answer.
+
+An `onRequest` hook now starts a `clock.sleep` for the budget, cancelled when the response
+closes. If it wins, the caller gets `503 REQUEST_BUDGET_EXCEEDED` with `retry-after`. The
+alternative — correcting ADR-0007 to describe what `requestTimeout` actually bounds — was
+rejected because the rung exists precisely so the ALB is never the component that answers a
+B2B caller.
+
+Two properties make this safe rather than a new race:
+
+- **One sender.** Every response in `app.ts` goes through `sendOnce`, which no-ops when
+  `reply.sent` is already true. The budget timer and a late handler cannot both write; the
+  loser is dropped, and it is only ever the slower duplicate of an answer already sent.
+- **No state is touched.** Firing says nothing about the workflow (INV-51). The in-flight
+  work continues, and the caller retries with the same idempotency key to collect the
+  result rather than starting a second operation.
+
+In the normal path it never fires: the waiter returns a 202 at the 20s synchronous
+deadline, two seconds inside the budget. It exists for throttling with SDK retries beneath
+`createWorkflow`, or a slow credential refresh.
+
+## D-032 — A failed credential refresh serves the cached document
+
+_Accepted 2026-08-24._
+
+`SecretsApiKeyStore.resolve` awaited a refresh whenever the cache TTL had expired and let
+the exception propagate, so a transient Secrets Manager failure returned 500 for every
+request — even though a perfectly valid credential index was still in memory. Worse,
+`#loadedAt` only advanced on success, so every request during the outage re-attempted the
+refresh: a dependency wobble amplified into a retry storm against the dependency.
+
+Once a document has loaded successfully, a failed refresh now keeps serving the cached
+index and defers the next attempt by `negativeCacheMs`. A store that has never loaded a
+document still throws, because an API that cannot authenticate anybody must fail loudly
+rather than reject every caller as unauthenticated.
+
+The cost is stated rather than hidden: while refreshes are failing, revocation stops
+propagating and a revoked key keeps working. That is why the failure is not silent — it
+emits `CredentialRefreshFailed`, which is alarmed (D-033), and logs through `onStaleServed`.
+Serving stale credentials for minutes is the better of two bad options against rejecting
+every legitimate B2B caller for the same period; if that trade is ever wrong for a
+deployment, this decision is what should be revisited.
+
+## D-033 — Terminal divergence is a distinct, alarmed signal
+
+_Accepted 2026-08-24._
+
+`docs/state-machine.md` step 3 says that on a lost terminal race the worker should compare
+the stored outcome against its own and log a conflict if they differ. The implementation
+counted `TerminalConflict` on _every_ `ALREADY_TERMINAL` without comparing anything, so the
+routine case (a duplicate delivery reaching the same conclusion) and a genuine correctness
+incident (two workers concluding COMPLETED and FAILED) were indistinguishable in both the
+log and the metric.
+
+The finalizer now compares. Same conclusion keeps `TerminalConflict` at info level. A
+different conclusion emits `TerminalDivergence` at error level with both the stored and the
+intended status. The same comparison guards the DECLINED path, which previously counted a
+routine `WorkflowFailed` even when it had lost the race to a COMPLETED.
+
+Three metrics gained alarms in the monitoring stack: `TerminalDivergence` (threshold zero —
+the terminal state is immutable, so one occurrence is unrecoverable and worth waking up
+for), `StaleWorkflow` (the only direct signal that a workflow is stuck past its business
+deadline, which matters more now that D-029 removed the option of failing them), and
+`CredentialRefreshFailed`.
+
+## D-034 — `beginStep` reports the status it replaced
+
+_Accepted 2026-08-24._
+
+`beginStep` claimed a step with `ReturnValues: "ALL_NEW"` and derived `previous` from the
+returned item. Since the same update sets `status` to `IN_PROGRESS`, `previous` was
+`IN_PROGRESS` on every claim, and the `UNKNOWN_EXTERNAL_STATE` marker written by a prior
+ambiguous attempt could never be observed — the marker ADR-0008 and INV-62 both name as the
+mechanism that forces reconciliation.
+
+Nothing was broken by this: the finalizer reconciles on _any_ `RESUMED` claim, which is
+strictly stronger than reconciling on the marker. But a marker that cannot be read is not
+evidence of anything, and the shape of the code actively invited an "optimisation" that
+gated the provider lookup on `claim.previous === "UNKNOWN_EXTERNAL_STATE"` — which would
+have silently disabled reconciliation and permitted a blind repeat of a possibly-executed
+operation.
+
+The claim now uses `ALL_OLD` and reconstructs the post-update record from the prior item
+plus the writes just applied, all of which are known locally. The reconstruction is passed
+through `decodeStep` rather than cast, so a mistake in it fails loudly instead of flowing on
+as a plausible but wrong `StepRecord`. Round trips are unchanged. Four integration tests
+cover it, including the complement case: a resume whose previous status is _not_
+`UNKNOWN_EXTERNAL_STATE` is still reported as a resume, pinning the behaviour that must not
+be narrowed.

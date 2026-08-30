@@ -303,6 +303,52 @@ export class MonitoringStack extends Stack {
       2,
     );
 
+    // The only direct signal that a workflow is stuck in PROCESSING past its business
+    // deadline. The reconciler reports these and deliberately never fails them (D-029), so
+    // if nobody watches this metric a stranded workflow is invisible until a customer asks.
+    alarm(
+      "StaleWorkflows",
+      new cloudwatch.Metric({
+        namespace: METRIC_NAMESPACE,
+        metricName: "StaleWorkflow",
+        period: Duration.minutes(5),
+        statistic: "Maximum",
+      }),
+      0,
+      "Workflows are still PROCESSING past their business deadline and are not progressing",
+      2,
+    );
+
+    // Two workers reached opposite conclusions about one workflow. One of them is wrong,
+    // the terminal state is immutable (INV-21), and no amount of retrying fixes it. This is
+    // a correctness incident, not a capacity signal, so a single occurrence breaches.
+    alarm(
+      "TerminalDivergence",
+      new cloudwatch.Metric({
+        namespace: METRIC_NAMESPACE,
+        metricName: "TerminalDivergence",
+        period: Duration.minutes(5),
+        statistic: "Sum",
+      }),
+      0,
+      "Two workers reached different terminal outcomes for one workflow; investigate now",
+    );
+
+    // The API is still authenticating from a cached credential document, but revocations
+    // have stopped propagating. Nothing is failing, which is exactly why it needs an alarm.
+    alarm(
+      "CredentialRefreshFailed",
+      new cloudwatch.Metric({
+        namespace: METRIC_NAMESPACE,
+        metricName: "CredentialRefreshFailed",
+        period: Duration.minutes(5),
+        statistic: "Sum",
+      }),
+      0,
+      "API key refreshes are failing; revoked keys will keep working until this recovers",
+      2,
+    );
+
     alarm(
       "ProviderUnknownState",
       new cloudwatch.Metric({

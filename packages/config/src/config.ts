@@ -24,11 +24,6 @@ export type Environment = (typeof ENVIRONMENTS)[number];
 export const ROLES = ["api", "worker", "publisher", "reconciler"] as const;
 export type Role = (typeof ROLES)[number];
 
-/** Env vars are strings; "false"/"0"/"no" must not read as truthy. */
-const booleanFromEnv = z
-  .enum(["true", "false", "1", "0", "yes", "no"])
-  .transform((value) => value === "true" || value === "1" || value === "yes");
-
 const millis = (defaultValue: number) =>
   z.coerce.number().int().positive().max(3_600_000).default(defaultValue);
 
@@ -127,12 +122,9 @@ export const configSchema = z
     /** An outbox event unpublished for longer than this is republished. */
     OUTBOX_STALE_AFTER_MS: millis(60_000),
     RECONCILE_PAGE_SIZE: z.coerce.number().int().min(1).max(1_000).default(50),
-    /**
-     * Off by default and deliberately so: automatically failing a workflow because a
-     * deadline passed would violate "a timeout is not a business failure" (INV-51). When
-     * off, the reconciler only reports.
-     */
-    RECONCILE_FAIL_STALE_WORKFLOWS: booleanFromEnv.default("false"),
+    // There is deliberately no switch here for failing stale workflows. A deadline that
+    // passed is not a business outcome, and no configuration may turn it into one
+    // (INV-51, D-029). The reconciler reports and alarms; it never judges.
   })
   .transform((env) => ({
     env: env.APP_ENV,
@@ -197,7 +189,6 @@ export const configSchema = z
     reconciler: {
       outboxStaleAfterMs: env.OUTBOX_STALE_AFTER_MS,
       pageSize: env.RECONCILE_PAGE_SIZE,
-      failStaleWorkflows: env.RECONCILE_FAIL_STALE_WORKFLOWS,
     },
   }))
   .superRefine((config, ctx) => {

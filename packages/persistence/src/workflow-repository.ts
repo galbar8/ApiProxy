@@ -394,15 +394,52 @@ export class WorkflowRepository {
             ":expiresAt": ttlSecondsFromNow(now, this.#workflowTtlDays),
             ...(externalRef === undefined ? {} : { ":externalRef": externalRef }),
           },
-          ReturnValues: "ALL_NEW",
+          // ALL_OLD, not ALL_NEW. This update sets `status` to IN_PROGRESS, so ALL_NEW
+          // reports IN_PROGRESS as the "previous" status on every single claim and the
+          // UNKNOWN_EXTERNAL_STATE marker written by a prior ambiguous attempt can never
+          // be observed. Reconciliation does not depend on it — the finalizer reconciles
+          // on any RESUMED claim, which is strictly stronger — but a marker that cannot be
+          // read is not evidence of anything, and INV-62 names it as the mechanism.
+          ReturnValues: "ALL_OLD",
         }),
       );
 
-      const step = decodeStep(result.Attributes);
-      // attempt is incremented on every claim, so 1 means this invocation created it.
-      return step.attempt <= 1
-        ? { outcome: "STARTED", step }
-        : { outcome: "RESUMED", step, previous: step.status };
+      // Both branches rebuild the post-update item from values that are fully known here,
+      // then run it through `decodeStep`. That brands the ids and, more usefully, makes a
+      // mistake in this reconstruction fail loudly instead of flowing on as a plausible
+      // but wrong StepRecord.
+
+      // Nothing existed before: this claim created the item.
+      if (result.Attributes === undefined) {
+        return {
+          outcome: "STARTED",
+          step: decodeStep({
+            requestId,
+            stepId,
+            status: "IN_PROGRESS",
+            attempt: 1,
+            createdAt: now,
+            updatedAt: now,
+            expiresAt: ttlSecondsFromNow(now, this.#workflowTtlDays),
+            ...(externalRef === undefined ? {} : { externalRef }),
+          }),
+        };
+      }
+
+      // The item existed, so this is a resumption: the prior status is the one thing
+      // ALL_NEW could never report, and it is exactly what INV-62 cares about.
+      const priorStep = decodeStep(result.Attributes);
+      const step: StepRecord = decodeStep({
+        ...priorStep,
+        status: "IN_PROGRESS",
+        attempt: priorStep.attempt + 1,
+        updatedAt: now,
+        // `externalRef` is written with `if_not_exists`, so an existing one wins.
+        ...(externalRef === undefined || priorStep.externalRef !== undefined
+          ? {}
+          : { externalRef }),
+      });
+      return { outcome: "RESUMED", step, previous: priorStep.status };
     } catch (error) {
       if (!isConditionalCheckFailed(error)) {
         throw classifyDynamoError(error);
@@ -628,14 +665,32 @@ export class WorkflowRepository {
               },
             },
             {
+              // A step can be failed before it was ever claimed: a stored input that
+              // fails validation is rejected before `beginStep` runs. `UpdateItem`
+              // upserts, so the identifying fields are backfilled here — without them the
+              // created item would fail `stepRecordSchema` on every later read. They are
+              // `if_not_exists` writes, so a real claim's `createdAt`, `attempt` and TTL
+              // survive untouched. A `ConditionExpression` is deliberately absent: this
+              // item shares a transaction with the workflow's terminal write, and failing
+              // it would strand the workflow in PROCESSING rather than protect anything.
               Update: {
                 TableName: this.#table,
                 Key: stepKey(params.requestId, params.stepId),
-                UpdateExpression: "SET #status = :stepStatus, updatedAt = :now",
+                UpdateExpression:
+                  "SET #status = :stepStatus, updatedAt = :now, " +
+                  "itemType = :itemType, requestId = :requestId, stepId = :stepId, " +
+                  "createdAt = if_not_exists(createdAt, :now), " +
+                  "attempt = if_not_exists(attempt, :zero), " +
+                  "expiresAt = if_not_exists(expiresAt, :expiresAt)",
                 ExpressionAttributeNames: { "#status": "status" },
                 ExpressionAttributeValues: {
                   ":stepStatus": params.status === "COMPLETED" ? "SUCCEEDED" : "FAILED",
                   ":now": now,
+                  ":itemType": ITEM_TYPES.step,
+                  ":requestId": params.requestId,
+                  ":stepId": params.stepId,
+                  ":zero": 0,
+                  ":expiresAt": ttlSecondsFromNow(now, this.#workflowTtlDays),
                 },
               },
             },

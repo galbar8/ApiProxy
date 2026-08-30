@@ -15,11 +15,6 @@ export interface ReconcilerDependencies {
   readonly metrics: Metrics;
   readonly outboxStaleAfterMs: number;
   readonly pageSize: number;
-  /**
-   * Off by default. Automatically failing a workflow because a deadline passed would
-   * assert a business outcome nobody observed, which is precisely what INV-51 forbids.
-   */
-  readonly failStaleWorkflows: boolean;
 }
 
 export interface ReconcileSummary {
@@ -93,19 +88,12 @@ export const createReconcilerHandler = (deps: ReconcilerDependencies) => {
       );
     }
 
-    if (deps.failStaleWorkflows) {
-      for (const ref of stale) {
-        await deps.repository.failIfProcessing({
-          requestId: ref.requestId,
-          stepId: "FINALIZE",
-          error: {
-            code: "BUSINESS_DEADLINE_EXCEEDED",
-            message: "workflow exceeded its business deadline",
-            failureClass: "NON_RETRYABLE",
-          },
-        });
-      }
-    }
+    // Nothing below this line judges a stale workflow. A passed deadline says the work is
+    // slow, not that it failed: the FINALIZE step may be UNKNOWN_EXTERNAL_STATE, meaning
+    // the provider may already have executed. Writing a terminal FAILED here would assert
+    // a business outcome nobody observed, destroy the marker that forces reconciliation
+    // (INV-62), and be unrewritable afterwards (INV-21). Deadlines are reported and
+    // alarmed; only a worker that actually knows an outcome may write one (INV-51).
 
     return {
       republished,

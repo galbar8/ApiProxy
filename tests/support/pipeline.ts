@@ -34,7 +34,6 @@ export interface PipelineOptions {
   /** Attach to a table someone else owns, e.g. one the API under test is already using. */
   readonly tableName?: string;
   readonly maxResultBytes?: number;
-  readonly reconcilerFailsStaleWorkflows?: boolean;
 }
 
 /**
@@ -128,7 +127,6 @@ export const createLocalPipeline = async (options: PipelineOptions = {}) => {
     metrics,
     outboxStaleAfterMs: -1,
     pageSize: 50,
-    failStaleWorkflows: options.reconcilerFailsStaleWorkflows ?? false,
   });
 
   const streamPump = new LocalStreamPump(streamArn);

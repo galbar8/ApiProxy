@@ -7,6 +7,7 @@ import {
   SQSClient,
   ChangeMessageVisibilityCommand,
   GetQueueAttributesCommand,
+  type Message,
 } from "@aws-sdk/client-sqs";
 import type { SQSEvent, SQSBatchResponse, SQSRecord } from "aws-lambda";
 import { anSqsRecord } from "./sqs-fixtures.js";
@@ -79,6 +80,49 @@ export interface DispatchResult {
 export type SqsHandler = (event: SQSEvent) => Promise<SQSBatchResponse>;
 
 /**
+ * ElasticMQ can return the same message twice in a single `ReceiveMessage` when it becomes
+ * visible again mid-receive, and only the newest receipt handle stays valid. A real event
+ * source mapping presents one record per message and never asks for the same handle to be
+ * deleted twice, so collapse duplicates here, keeping the last handle seen — the live one.
+ * This makes the harness reproduce the mapping's contract; the duplicate *delivery* the
+ * suites rely on is injected deliberately through `duplicateInBatch` and `redeliverBatch`,
+ * never taken from an emulator accident (ADR-0009).
+ */
+const collapseToOneRecordPerMessage = (messages: readonly Message[]): Message[] => {
+  const newestByMessageId = new Map<string, Message>();
+  for (const [index, message] of messages.entries()) {
+    newestByMessageId.set(
+      message.MessageId ?? `unidentified-${String(index)}`,
+      message,
+    );
+  }
+  return [...newestByMessageId.values()];
+};
+
+/**
+ * A receipt handle is single-use, and it expires the moment its message becomes visible
+ * again. Either way the message is already deleted or already queued for redelivery, which
+ * is precisely what a real event source mapping shrugs off. Anything else is a real fault
+ * and still throws.
+ */
+const isSpentReceiptHandle = (error: unknown): boolean =>
+  error instanceof Error &&
+  ["ReceiptHandleIsInvalid", "InvalidParameterValue", "MessageNotInflight"].includes(
+    error.name,
+  );
+
+/** Returns whether the acknowledgement actually landed. */
+const tolerateSpentHandle = async (send: () => Promise<unknown>): Promise<boolean> => {
+  try {
+    await send();
+    return true;
+  } catch (error) {
+    if (isSpentReceiptHandle(error)) return false;
+    throw error;
+  }
+};
+
+/**
  * A deliberately minimal stand-in for a Lambda event source mapping.
  *
  * It reproduces the contract that matters — batches in, `batchItemFailures` out, only
@@ -102,7 +146,7 @@ export const dispatchOnce = async (
     }),
   );
 
-  const messages = received.Messages ?? [];
+  const messages = collapseToOneRecordPerMessage(received.Messages ?? []);
   if (messages.length === 0) {
     return { received: 0, deleted: 0, reportedFailures: 0 };
   }
@@ -146,23 +190,30 @@ export const dispatchOnce = async (
   for (const message of messages) {
     if (message.MessageId !== undefined && failed.has(message.MessageId)) {
       // Make the failure visible again immediately so tests do not wait out a
-      // visibility timeout.
-      await client.send(
-        new ChangeMessageVisibilityCommand({
-          QueueUrl: queueUrl,
-          ReceiptHandle: message.ReceiptHandle ?? "",
-          VisibilityTimeout: 0,
-        }),
+      // visibility timeout. If the handle is already spent the message is visible
+      // anyway, which is the outcome this line exists to produce.
+      await tolerateSpentHandle(
+        async () =>
+          await client.send(
+            new ChangeMessageVisibilityCommand({
+              QueueUrl: queueUrl,
+              ReceiptHandle: message.ReceiptHandle ?? "",
+              VisibilityTimeout: 0,
+            }),
+          ),
       );
       continue;
     }
-    await client.send(
-      new DeleteMessageCommand({
-        QueueUrl: queueUrl,
-        ReceiptHandle: message.ReceiptHandle ?? "",
-      }),
+    const acknowledged = await tolerateSpentHandle(
+      async () =>
+        await client.send(
+          new DeleteMessageCommand({
+            QueueUrl: queueUrl,
+            ReceiptHandle: message.ReceiptHandle ?? "",
+          }),
+        ),
     );
-    deleted += 1;
+    if (acknowledged) deleted += 1;
   }
 
   return {

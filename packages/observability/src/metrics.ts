@@ -88,7 +88,13 @@ export const METRICS = {
   pollAttempts: "PollAttempts",
   pollDuration: "PollDurationMs",
   conditionalCheckFailed: "ConditionalCheckFailed",
+  /** A terminal write lost a race to the *same* conclusion. Benign duplicate delivery. */
   terminalConflict: "TerminalConflict",
+  /**
+   * A terminal write lost a race to a *different* conclusion. Never benign: two workers
+   * reached opposite outcomes for one workflow, so one of them is wrong.
+   */
+  terminalDivergence: "TerminalDivergence",
   duplicateMessage: "DuplicateMessage",
   messageProcessed: "MessageProcessed",
   messageFailed: "MessageFailed",
@@ -99,4 +105,11 @@ export const METRICS = {
   providerCall: "ProviderCall",
   providerUnknownState: "ProviderUnknownState",
   providerReconciled: "ProviderReconciled",
+  /**
+   * A credential refresh failed and the cached document was served instead. The API is
+   * still authenticating, but revocations have stopped propagating.
+   */
+  credentialRefreshFailed: "CredentialRefreshFailed",
+  /** A request exhausted the server-side request budget before the ALB would give up. */
+  requestBudgetExceeded: "RequestBudgetExceeded",
 } as const;

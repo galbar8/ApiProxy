@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { WorkflowRepository, type CreateWorkflowInput } from "@workflow/persistence";
-import { payloadFingerprint } from "@workflow/idempotency";
+import { deriveExternalRef, payloadFingerprint } from "@workflow/idempotency";
 import { systemClock, type StepId } from "@workflow/contracts";
 import {
   anIdempotencyKey,
@@ -156,6 +156,83 @@ describe("tenant isolation", () => {
   });
 });
 
+describe("step claiming", () => {
+  const finalize: StepId = "FINALIZE";
+
+  it("reports the real previous status when resuming, not the status it just wrote", async () => {
+    // beginStep sets status to IN_PROGRESS as part of the claim. Reading the post-update
+    // item would therefore report IN_PROGRESS as the "previous" status on every claim,
+    // making the UNKNOWN_EXTERNAL_STATE marker unobservable — the marker ADR-0008 and
+    // INV-62 name as the reason a resumed attempt must reconcile before acting.
+    const input = creationInput();
+    await repository.createWorkflow(input);
+    const externalRef = deriveExternalRef(input.requestId, finalize);
+
+    const first = await repository.beginStep(input.requestId, finalize, externalRef);
+    expect(first.outcome).toBe("STARTED");
+
+    await repository.markStepUnknownExternalState(input.requestId, finalize);
+
+    const resumed = await repository.beginStep(input.requestId, finalize, externalRef);
+    expect(resumed.outcome).toBe("RESUMED");
+    if (resumed.outcome !== "RESUMED") throw new Error("unreachable");
+    expect(resumed.previous).toBe("UNKNOWN_EXTERNAL_STATE");
+    expect(resumed.step.status).toBe("IN_PROGRESS");
+    expect(resumed.step.attempt).toBe(2);
+    expect(resumed.step.externalRef).toBe(externalRef);
+    expect(resumed.step.createdAt).toBe(first.step.createdAt);
+  });
+
+  it("reports a resume whose previous status is not UNKNOWN_EXTERNAL_STATE", async () => {
+    // The complement of the test above. A crash between the claim and any outcome leaves
+    // the step IN_PROGRESS, and that resume must still be reported as a resume: the
+    // finalizer reconciles on *any* RESUMED claim, and nothing may narrow that to the
+    // marker alone.
+    const input = creationInput();
+    await repository.createWorkflow(input);
+    const externalRef = deriveExternalRef(input.requestId, finalize);
+
+    await repository.beginStep(input.requestId, finalize, externalRef);
+    const resumed = await repository.beginStep(input.requestId, finalize, externalRef);
+
+    expect(resumed.outcome).toBe("RESUMED");
+    if (resumed.outcome !== "RESUMED") throw new Error("unreachable");
+    expect(resumed.previous).toBe("IN_PROGRESS");
+  });
+
+  it("keeps the first external reference when a later claim offers a different one", async () => {
+    // The provider identity is fixed at first claim (INV-63). A second claim cannot
+    // repoint it, or a retry would execute under a new identity and double-charge.
+    const input = creationInput();
+    await repository.createWorkflow(input);
+    const original = deriveExternalRef(input.requestId, finalize);
+    const different = deriveExternalRef(aRequestId(), finalize);
+
+    await repository.beginStep(input.requestId, finalize, original);
+    const resumed = await repository.beginStep(input.requestId, finalize, different);
+
+    expect(resumed.step.externalRef).toBe(original);
+    const stored = await repository.getStep(input.requestId, finalize);
+    expect(stored?.externalRef).toBe(original);
+  });
+
+  it("refuses to reclaim a step that already succeeded", async () => {
+    const input = creationInput();
+    await repository.createWorkflow(input);
+    const externalRef = deriveExternalRef(input.requestId, finalize);
+    await repository.beginStep(input.requestId, finalize, externalRef);
+    await repository.completeIfProcessing({
+      requestId: input.requestId,
+      stepId: finalize,
+      result: { providerOperationId: "op-claimed" },
+    });
+
+    const again = await repository.beginStep(input.requestId, finalize, externalRef);
+    expect(again.outcome).toBe("ALREADY_SUCCEEDED");
+    expect(again.step.status).toBe("SUCCEEDED");
+  });
+});
+
 describe("terminal transitions", () => {
   const finalize: StepId = "FINALIZE";
 
@@ -180,6 +257,62 @@ describe("terminal transitions", () => {
     if (secondAttempt.outcome !== "ALREADY_TERMINAL") throw new Error("unreachable");
     // The winner's outcome survived (INV-21).
     expect(secondAttempt.workflow.status).toBe("COMPLETED");
+  });
+
+  it("writes a readable step item when failing a step that was never claimed", async () => {
+    // The finalizer rejects a stored input that fails validation *before* it claims the
+    // step, so the terminal write upserts a step item no `beginStep` ever created. An
+    // item missing requestId/stepId/attempt/createdAt would parse-fail on every later
+    // read, turning a clean business failure into a permanent NonRetryableError.
+    const input = creationInput();
+    await repository.createWorkflow(input);
+
+    const failed = await repository.failIfProcessing({
+      requestId: input.requestId,
+      stepId: finalize,
+      error: {
+        code: "WORKFLOW_INPUT_INVALID",
+        message: "stored workflow input failed validation",
+        failureClass: "NON_RETRYABLE",
+      },
+    });
+    expect(failed.outcome).toBe("APPLIED");
+
+    // The read is the assertion: getStep decodes through stepRecordSchema and throws
+    // NonRetryableError on a half-populated item.
+    const step = await repository.getStep(input.requestId, finalize);
+    expect(step).toBeDefined();
+    expect(step?.status).toBe("FAILED");
+    expect(step?.requestId).toBe(input.requestId);
+    expect(step?.stepId).toBe(finalize);
+    expect(step?.attempt).toBe(0);
+    expect(step?.createdAt).toBeGreaterThan(0);
+  });
+
+  it("leaves a claimed step's identity intact when the workflow fails", async () => {
+    // The same upsert must not trample what a real claim owns.
+    const input = creationInput();
+    await repository.createWorkflow(input);
+    const externalRef = deriveExternalRef(input.requestId, finalize);
+    const claim = await repository.beginStep(input.requestId, finalize, externalRef);
+    expect(claim.outcome).toBe("STARTED");
+
+    await repository.failIfProcessing({
+      requestId: input.requestId,
+      stepId: finalize,
+      error: {
+        code: "PROVIDER_REJECTED",
+        message: "no",
+        failureClass: "NON_RETRYABLE",
+      },
+    });
+
+    const step = await repository.getStep(input.requestId, finalize);
+    expect(step?.status).toBe("FAILED");
+    expect(step?.attempt).toBe(1);
+    // The provider identity a retry would reuse survives the terminal write (INV-63).
+    expect(step?.externalRef).toBe(externalRef);
+    expect(step?.createdAt).toBe(claim.step.createdAt);
   });
 
   it("lets exactly one writer win when COMPLETED and FAILED race", async () => {
