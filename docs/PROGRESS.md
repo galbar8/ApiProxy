@@ -3,13 +3,15 @@
 Repository reality, not intent. Updated after every meaningful implementation, phase,
 blocker, reliability, test or deployment-state change.
 
-**Last updated:** 2026-08-24
+**Last updated:** 2026-08-30
 **Current phase:** Phase 8 — review. Both reviews have now been run. `/aws-review`
 CRITICAL (none) / HIGH (4) / MEDIUM (11) are fixed. `/reliability-review` CRITICAL (none) /
 HIGH (2) and its five open MEDIUM findings are fixed. Both must be re-run by a human to
 confirm — see B-002.
 **Deployment state:** never deployed. No AWS account, credentials or CLI are configured
-in this environment. Nothing has been created in any AWS account.
+in this environment. Nothing has been created in any AWS account. The four deployment gaps
+found on 2026-08-24 (G-001 to G-004) are now fixed in code, so a first deploy no longer
+requires hand-patching the source.
 
 ## Phase status
 
@@ -58,33 +60,48 @@ in this environment. Nothing has been created in any AWS account.
 - `apps/reconciler` — scheduled sweep for unpublished outbox events and stale workflows.
 - `apps/fake-provider` — simulated provider with fault injection (ADR-0008).
 
-**Infrastructure** — `infrastructure/cdk`: network (no NAT, VPC endpoints), data
-(DynamoDB with streams/TTL/PITR/sparse GSIs), messaging (queues, DLQs, redrive),
-workers (Lambdas, event source mappings, schedule, stream DLQ), api (ALB, WAF, Fargate,
-autoscaling, ECR, Secrets Manager), monitoring (17 alarms).
+**Infrastructure** — `infrastructure/cdk`, seven stacks: network (no NAT, VPC endpoints),
+ecr (image repository, alone, so it exists before the service that pulls from it), data
+(DynamoDB with streams/TTL/PITR/sparse GSIs), messaging (queues, DLQs, redrive), workers
+(Lambdas, event source mappings, schedule, stream DLQ), api (ALB, WAF, Fargate,
+autoscaling, Secrets Manager), monitoring (17 alarms).
+
+**Deployment profiles** — `-c profile=standard|minimal`, orthogonal to `-c env` (D-035).
+`standard` is the default everywhere and is unchanged. `minimal` drops the web ACL, the
+five interface VPC endpoints and container insights, and moves tasks to public subnets so
+they can still reach ECR without those endpoints (D-036). `applyProfile` throws for any
+environment but `dev`. Estimated idle cost: ~$125/month standard, ~$35/month minimal.
 
 **Other** — `Dockerfile` (non-root, bundled), `docker-compose.local.yml`,
 `.env.example`, `.claude/rules/*`, skills relocated to `.claude/skills/`,
-`DEPLOYMENT.md` (the AWS deployment guide, linked from `README.md`).
+`DEPLOYMENT.md` (rewritten 2026-08-30 for a reader with no AWS experience: costs first,
+a glossary, account setup, teardown), and `scripts/deploy-dev.sh` / `scripts/destroy-dev.sh`
+(guided first deploy and teardown; both require an explicitly typed confirmation and
+neither passes `--require-approval never`).
 
 ## Verification state
 
-All commands run on 2026-08-23 from a clean tree. Production synth now requires
+All commands run on 2026-08-30 from a clean tree. Production synth requires
 `-c env=production -c availabilityZones=... -c certificateArn=... -c providerBaseUrl=...`
 `-c alarmEmails=... -c imageTag=<digest|sha|version>`; each missing value throws by design
 (D-021, D-022).
 
-| Check       | Command                 | Result                                                                 |
-| ----------- | ----------------------- | ---------------------------------------------------------------------- |
-| Lint        | `pnpm lint`             | Pass                                                                   |
-| Typecheck   | `pnpm typecheck`        | Pass (app program + CDK program)                                       |
-| Unit        | `pnpm test`             | Pass — 194 tests, 13 files (59 of them CDK)                            |
-| Integration | `pnpm test:integration` | Pass — 55 tests (DynamoDB Local)                                       |
-| E2E         | `pnpm test:e2e`         | Pass — 10 tests; 30 consecutive green runs (was ~50% flaky)            |
-| Chaos       | `pnpm test:chaos`       | Pass — 13 tests                                                        |
-| Load        | `pnpm test:load`        | Pass — 200 req @ 20 concurrent, p50 918ms, p95 1564ms, 0 sync timeouts |
-| CDK synth   | `pnpm cdk:synth`        | Pass (dev; production needs the five context values below)             |
-| CDK diff    | `pnpm cdk:diff`         | **Not run — see B-001**                                                |
+| Check       | Command                 | Result                                                                |
+| ----------- | ----------------------- | --------------------------------------------------------------------- |
+| Format      | `pnpm format:check`     | Pass                                                                  |
+| Lint        | `pnpm lint`             | Pass                                                                  |
+| Typecheck   | `pnpm typecheck`        | Pass (app program + CDK program)                                      |
+| Unit        | `pnpm test`             | Pass — 208 tests, 13 files (73 of them CDK)                           |
+| Integration | `pnpm test:integration` | Pass — 55 tests (DynamoDB Local)                                      |
+| E2E         | `pnpm test:e2e`         | Pass — 10 tests                                                       |
+| Chaos       | `pnpm test:chaos`       | Pass — 13 tests                                                       |
+| Load        | `pnpm test:load`        | Pass — 200 req @ 20 concurrent, p50 273ms, p95 486ms, 0 sync timeouts |
+| CDK synth   | `pnpm cdk:synth`        | Pass — dev standard, dev minimal, and full production                 |
+| CDK diff    | `pnpm cdk:diff`         | **Not run — see B-001**                                               |
+
+Synth guards exercised by hand on 2026-08-30, each refusing as designed:
+`-c env=production -c profile=minimal` → "profile=minimal is only available for dev";
+`-c profile=cheap` → `unknown profile "cheap"; expected standard or minimal`.
 
 ## Required failure scenarios
 
@@ -241,34 +258,41 @@ Still open (LOW, none blocking):
 - CDK's `InterfaceVpcEndpoint` defaults to `open: true`, adding a VPC-wide ingress rule
   alongside the intended security-group reference.
 
-## Deployment gaps
+## Deployment gaps — all four fixed 2026-08-30
 
-Found on 2026-08-24 while writing `DEPLOYMENT.md`. None affects local behaviour or any
-test; all four are only reachable by actually deploying, which is why the suites are green.
-Each is documented in `DEPLOYMENT.md` section 3 with the fix.
+Found on 2026-08-24 while writing `DEPLOYMENT.md`. None affected local behaviour or any
+test; all four were only reachable by actually deploying, which is why the suites were
+green throughout. They are now fixed in code (D-037, D-038) rather than documented as
+manual patches: a deployment guide that opens by asking the reader to edit source is not a
+deployment guide. Each has a CDK test under "reachability gaps that only a real deployment
+would expose".
 
-- **G-001 — the API container is never given `AWS_REGION`.** ECS does not inject it (Lambda
+- **G-001 — _fixed._ The API container was never given `AWS_REGION`.** ECS does not inject it (Lambda
   does), and `packages/config` defaults it to `us-east-1`, which is what
   `apps/api/src/composition.ts` hands to the DynamoDB and Secrets Manager clients. Any
   deployment outside `us-east-1` would point the API at a table that does not exist.
-  Fix: set `AWS_REGION` in the container environment in `api-stack.ts`.
+  Fixed: `AWS_REGION: this.region` in the container environment in `api-stack.ts`.
 
-- **G-002 — the API container is never given `PUBLIC_BASE_URL`.** It defaults to
+- **G-002 — _fixed._ The API container was never given `PUBLIC_BASE_URL`.** It defaults to
   `http://localhost:8080`, which is the `pollUrl` handed to every caller that receives a
   `202`. The recovery path advertised to B2B clients would point at their own machine.
-  Fix: set `PUBLIC_BASE_URL` in the container environment in `api-stack.ts`.
+  Fixed: `ApiStack` derives it — `-c publicBaseUrl` if supplied, else the Route 53
+  record, else the load balancer's DNS name with the scheme its listener serves — and
+  sets it with `container.addEnvironment` once the listener exists.
 
-- **G-003 — the ALB security group allows 443 only.** `network-stack.ts` adds one ingress
+- **G-003 — _fixed._ The ALB security group allowed 443 only.** `network-stack.ts` adds one ingress
   rule; `api-stack.ts` creates a listener on port 80 in dev (no certificate) and an
   HTTP→HTTPS redirect listener on port 80 otherwise. Both are unreachable: a dev
   environment deploys successfully and cannot be called at all.
-  Fix: add port 80 ingress to `albSecurityGroup`.
+  Fixed: port 80 ingress added to `albSecurityGroup` in `network-stack.ts`.
 
-- **G-004 — the ECR repository is created by the stack that also starts the ECS service.**
+- **G-004 — _fixed._ The ECR repository was created by the stack that also starts the ECS service.**
   On a first deploy there is nowhere to push the image before the service tries to pull it,
   and the generated repository name changes on every retry, so an image pushed to a
-  rolled-back repository is lost. Workable procedure in `DEPLOYMENT.md` section 5;
-  the fix is to move the repository into its own stack.
+  rolled-back repository is lost. Fixed: the repository moved into its own `EcrStack`,
+  deployed and pushed to before anything that consumes it. Repositories in `DESTROY`
+  environments also get `emptyOnDelete: true`, so a dev environment can actually be
+  deleted.
 
 ## Known risks
 
@@ -298,6 +322,16 @@ Each is documented in `DEPLOYMENT.md` section 3 with the fix.
 - **R-007** The API key document must be populated out of band after deployment; the
   stack creates an empty secret. Until it is populated, every request is correctly
   rejected with `401`.
+- **R-009** The `minimal` profile places tasks in public subnets with a public IP and no
+  interface endpoints (D-036). Ingress is unchanged — only the load balancer's security
+  group may reach a task, asserted by a test — but egress genuinely leaves the VPC, which
+  the `0.0.0.0/0:443` rule accepted in D-020 was originally justified as not doing. The
+  profile is refused outside `dev` at synth time. It is a convenience for looking at the
+  service, never a posture for traffic.
+- **R-010** The cost figures in `DEPLOYMENT.md` (~$35 and ~$125 per idle month) are
+  derived from us-east-1 list prices, not measured against a bill. They are labelled as
+  estimates in the guide and must not be quoted as a commitment.
+
 - **R-008** DynamoDB Streams shard fan-out is not load-tested. The outbox publisher is a
   single consumer per shard; sustained high write rates should be validated before
   production.
@@ -307,10 +341,14 @@ Each is documented in `DEPLOYMENT.md` section 3 with the fix.
 1. Human re-runs **both** `/aws-review` and `/reliability-review` to confirm the fixes;
    fix anything CRITICAL/HIGH that either surfaces. Note that `/reliability-review` ran
    against the pre-`/aws-review` tree, so a re-run is the first pass over the current one.
+   Neither has seen the profile work or the four gap fixes.
 2. Configure an AWS account, run `pnpm cdk:diff`, review the plan.
-3. Deploy to `dev` only, with explicit human approval, and validate R-002 items there.
-   First deploy must confirm what only a real environment can: that image pull, log
-   delivery, secret fetch and DynamoDB access all succeed with no NAT (D-020).
+3. Deploy to `dev` only, with explicit human approval — `scripts/deploy-dev.sh` is the
+   guided path and requires a typed confirmation — and validate R-002 items there. The
+   first deploy must confirm what only a real environment can: that image pull, log
+   delivery, secret fetch and DynamoDB access all succeed with no NAT (D-020). Deploying
+   `standard` at least once is what validates the endpoint path; `minimal` exercises a
+   different route and is not evidence about it.
 4. Load-test against real infrastructure and replace the derived
    `requestsPerTargetPerMinute` with a measured value (R-003, D-025).
 5. Watch WAF managed-rule counts in dev before trusting blocking mode elsewhere.

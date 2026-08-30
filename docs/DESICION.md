@@ -4,42 +4,46 @@ The authoritative register of accepted and superseded engineering and architectu
 decisions. Detailed rationale lives in `docs/adr/`. History is never rewritten: a changed
 decision is marked `Superseded` and a new entry is added below it.
 
-| ID    | Decision                                                                                                                                         | Status   | Date       | Detail                                                   |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------- | ---------- | -------------------------------------------------------- |
-| D-001 | Single-table DynamoDB model, request-scoped partition keys, tenant ownership checked in application code                                         | Accepted | 2026-08-22 | [ADR-0001](adr/0001-dynamodb-single-table-key-design.md) |
-| D-002 | Per-tenant API keys in Secrets Manager as the production B2B auth mechanism                                                                      | Accepted | 2026-08-22 | [ADR-0002](adr/0002-b2b-authentication-api-keys.md)      |
-| D-003 | SQS Standard queues, not FIFO; safety comes from application idempotency                                                                         | Accepted | 2026-08-22 | [ADR-0003](adr/0003-sqs-standard-not-fifo.md)            |
-| D-004 | Transactional outbox committed with state, published from DynamoDB Streams, with a scheduled reconciler                                          | Accepted | 2026-08-22 | [ADR-0004](adr/0004-transactional-outbox-via-streams.md) |
-| D-005 | Response semantics: `200` for both terminal outcomes, `202` at the synchronous deadline, `409` on idempotency conflict, `404` on tenant mismatch | Accepted | 2026-08-22 | [ADR-0005](adr/0005-synchronous-response-semantics.md)   |
-| D-006 | No S3; hard payload and result size caps instead                                                                                                 | Accepted | 2026-08-22 | [ADR-0006](adr/0006-no-s3-bounded-payloads.md)           |
-| D-007 | Explicit timeout ladder validated at startup; bounded, jittered, strongly consistent, abortable polling behind a `WorkflowWaiter` interface      | Accepted | 2026-08-22 | [ADR-0007](adr/0007-timeout-ladder-and-polling.md)       |
-| D-008 | External provider classified `IDEMPOTENCY_PROTECTED` + `RECONCILABLE`; timeouts are `UNKNOWN_EXTERNAL_STATE`, never `RETRYABLE`                  | Accepted | 2026-08-22 | [ADR-0008](adr/0008-external-provider-integration.md)    |
-| D-009 | Local test topology: DynamoDB Local + ElasticMQ + in-process dispatcher that injects adversarial delivery                                        | Accepted | 2026-08-22 | [ADR-0009](adr/0009-local-test-topology.md)              |
-| D-010 | Two-step worker chain (`worker-a` → `finalizer`) rather than one worker                                                                          | Accepted | 2026-08-22 | Below                                                    |
-| D-011 | Workspace packages consumed as TypeScript source; no build step between edit and test                                                            | Accepted | 2026-08-22 | Below                                                    |
-| D-012 | Skills relocated from `.claude/<name>/` to `.claude/skills/<name>/`                                                                              | Accepted | 2026-08-22 | Below                                                    |
-| D-013 | VPC with no NAT gateways; workers run outside the VPC                                                                                            | Accepted | 2026-08-23 | Below                                                    |
-| D-014 | Production must name its availability zones or synthesise against a concrete region                                                              | Accepted | 2026-08-23 | Below                                                    |
-| D-015 | Sparse GSI partition keys are sharded                                                                                                            | Accepted | 2026-08-23 | Below                                                    |
-| D-016 | The API holds no SQS permissions at all                                                                                                          | Accepted | 2026-08-23 | Below                                                    |
-| D-017 | The DynamoDB Streams consumer has its own failure destination                                                                                    | Accepted | 2026-08-23 | Below                                                    |
-| D-018 | `exactOptionalPropertyTypes` is relaxed for CDK code only                                                                                        | Accepted | 2026-08-23 | Below                                                    |
-| D-019 | WAF on the ALB: per-IP rate limit always blocking, managed rules counting in dev                                                                 | Accepted | 2026-08-23 | Below                                                    |
-| D-020 | Task egress is opened to `0.0.0.0/0` on 443, deliberately                                                                                        | Accepted | 2026-08-23 | Below                                                    |
-| D-021 | Production refuses defaulted deployment inputs                                                                                                   | Accepted | 2026-08-23 | Below                                                    |
-| D-022 | Alarms must have a subscriber, enforced at synth time                                                                                            | Accepted | 2026-08-23 | Below                                                    |
-| D-023 | Metrics publish an aggregate series alongside every dimensioned one                                                                              | Accepted | 2026-08-23 | Below                                                    |
-| D-024 | The readiness drain window is derived from the health-check configuration                                                                        | Accepted | 2026-08-23 | Below                                                    |
-| D-025 | Autoscaling tracks held connections, not CPU or memory                                                                                           | Accepted | 2026-08-23 | Below                                                    |
-| D-026 | Deployment failure is made visible, not just automatic                                                                                           | Accepted | 2026-08-23 | Below                                                    |
-| D-027 | No ALB access logs; S3 remains excluded                                                                                                          | Accepted | 2026-08-23 | Below                                                    |
-| D-028 | Public DNS is optional and lookup-free                                                                                                           | Accepted | 2026-08-23 | Below                                                    |
-| D-029 | A passed deadline is never a business failure, and nothing can configure it to be                                                                | Accepted | 2026-08-24 | Below                                                    |
-| D-030 | The terminal step write backfills a schema-valid item                                                                                            | Accepted | 2026-08-24 | Below                                                    |
-| D-031 | The request budget is enforced, not merely configured                                                                                            | Accepted | 2026-08-24 | Below                                                    |
-| D-032 | A failed credential refresh serves the cached document                                                                                           | Accepted | 2026-08-24 | Below                                                    |
-| D-033 | Terminal divergence is a distinct, alarmed signal                                                                                                | Accepted | 2026-08-24 | Below                                                    |
-| D-034 | `beginStep` reports the status it replaced                                                                                                       | Accepted | 2026-08-24 | Below                                                    |
+| ID    | Decision                                                                                                                                         | Status                      | Date       | Detail                                                   |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------- | ---------- | -------------------------------------------------------- |
+| D-001 | Single-table DynamoDB model, request-scoped partition keys, tenant ownership checked in application code                                         | Accepted                    | 2026-08-22 | [ADR-0001](adr/0001-dynamodb-single-table-key-design.md) |
+| D-002 | Per-tenant API keys in Secrets Manager as the production B2B auth mechanism                                                                      | Accepted                    | 2026-08-22 | [ADR-0002](adr/0002-b2b-authentication-api-keys.md)      |
+| D-003 | SQS Standard queues, not FIFO; safety comes from application idempotency                                                                         | Accepted                    | 2026-08-22 | [ADR-0003](adr/0003-sqs-standard-not-fifo.md)            |
+| D-004 | Transactional outbox committed with state, published from DynamoDB Streams, with a scheduled reconciler                                          | Accepted                    | 2026-08-22 | [ADR-0004](adr/0004-transactional-outbox-via-streams.md) |
+| D-005 | Response semantics: `200` for both terminal outcomes, `202` at the synchronous deadline, `409` on idempotency conflict, `404` on tenant mismatch | Accepted                    | 2026-08-22 | [ADR-0005](adr/0005-synchronous-response-semantics.md)   |
+| D-006 | No S3; hard payload and result size caps instead                                                                                                 | Accepted                    | 2026-08-22 | [ADR-0006](adr/0006-no-s3-bounded-payloads.md)           |
+| D-007 | Explicit timeout ladder validated at startup; bounded, jittered, strongly consistent, abortable polling behind a `WorkflowWaiter` interface      | Accepted                    | 2026-08-22 | [ADR-0007](adr/0007-timeout-ladder-and-polling.md)       |
+| D-008 | External provider classified `IDEMPOTENCY_PROTECTED` + `RECONCILABLE`; timeouts are `UNKNOWN_EXTERNAL_STATE`, never `RETRYABLE`                  | Accepted                    | 2026-08-22 | [ADR-0008](adr/0008-external-provider-integration.md)    |
+| D-009 | Local test topology: DynamoDB Local + ElasticMQ + in-process dispatcher that injects adversarial delivery                                        | Accepted                    | 2026-08-22 | [ADR-0009](adr/0009-local-test-topology.md)              |
+| D-010 | Two-step worker chain (`worker-a` → `finalizer`) rather than one worker                                                                          | Accepted                    | 2026-08-22 | Below                                                    |
+| D-011 | Workspace packages consumed as TypeScript source; no build step between edit and test                                                            | Accepted                    | 2026-08-22 | Below                                                    |
+| D-012 | Skills relocated from `.claude/<name>/` to `.claude/skills/<name>/`                                                                              | Accepted                    | 2026-08-22 | Below                                                    |
+| D-013 | VPC with no NAT gateways; workers run outside the VPC                                                                                            | Accepted (amended by D-036) | 2026-08-23 | Below                                                    |
+| D-014 | Production must name its availability zones or synthesise against a concrete region                                                              | Accepted                    | 2026-08-23 | Below                                                    |
+| D-015 | Sparse GSI partition keys are sharded                                                                                                            | Accepted                    | 2026-08-23 | Below                                                    |
+| D-016 | The API holds no SQS permissions at all                                                                                                          | Accepted                    | 2026-08-23 | Below                                                    |
+| D-017 | The DynamoDB Streams consumer has its own failure destination                                                                                    | Accepted                    | 2026-08-23 | Below                                                    |
+| D-018 | `exactOptionalPropertyTypes` is relaxed for CDK code only                                                                                        | Accepted                    | 2026-08-23 | Below                                                    |
+| D-019 | WAF on the ALB: per-IP rate limit always blocking, managed rules counting in dev                                                                 | Accepted (amended by D-035) | 2026-08-23 | Below                                                    |
+| D-020 | Task egress is opened to `0.0.0.0/0` on 443, deliberately                                                                                        | Accepted (amended by D-036) | 2026-08-23 | Below                                                    |
+| D-021 | Production refuses defaulted deployment inputs                                                                                                   | Accepted                    | 2026-08-23 | Below                                                    |
+| D-022 | Alarms must have a subscriber, enforced at synth time                                                                                            | Accepted                    | 2026-08-23 | Below                                                    |
+| D-023 | Metrics publish an aggregate series alongside every dimensioned one                                                                              | Accepted                    | 2026-08-23 | Below                                                    |
+| D-024 | The readiness drain window is derived from the health-check configuration                                                                        | Accepted                    | 2026-08-23 | Below                                                    |
+| D-025 | Autoscaling tracks held connections, not CPU or memory                                                                                           | Accepted                    | 2026-08-23 | Below                                                    |
+| D-026 | Deployment failure is made visible, not just automatic                                                                                           | Accepted                    | 2026-08-23 | Below                                                    |
+| D-027 | No ALB access logs; S3 remains excluded                                                                                                          | Accepted                    | 2026-08-23 | Below                                                    |
+| D-028 | Public DNS is optional and lookup-free                                                                                                           | Accepted                    | 2026-08-23 | Below                                                    |
+| D-029 | A passed deadline is never a business failure, and nothing can configure it to be                                                                | Accepted                    | 2026-08-24 | Below                                                    |
+| D-030 | The terminal step write backfills a schema-valid item                                                                                            | Accepted                    | 2026-08-24 | Below                                                    |
+| D-031 | The request budget is enforced, not merely configured                                                                                            | Accepted                    | 2026-08-24 | Below                                                    |
+| D-032 | A failed credential refresh serves the cached document                                                                                           | Accepted                    | 2026-08-24 | Below                                                    |
+| D-033 | Terminal divergence is a distinct, alarmed signal                                                                                                | Accepted                    | 2026-08-24 | Below                                                    |
+| D-034 | `beginStep` reports the status it replaced                                                                                                       | Accepted                    | 2026-08-24 | Below                                                    |
+| D-035 | Deployment profiles: `minimal` drops optional infrastructure and is refused outside `dev`                                                        | Accepted                    | 2026-08-30 | Below                                                    |
+| D-036 | Under `minimal`, tasks run in public subnets with no interface endpoints                                                                         | Accepted                    | 2026-08-30 | Below                                                    |
+| D-037 | The image repository owns its own stack                                                                                                          | Accepted                    | 2026-08-30 | Below                                                    |
+| D-038 | The stack tells the API its region and its public origin; the app defaults neither                                                               | Accepted                    | 2026-08-30 | Below                                                    |
 
 ## D-010 — Two-step worker chain
 
@@ -415,3 +419,77 @@ as a plausible but wrong `StepRecord`. Round trips are unchanged. Four integrati
 cover it, including the complement case: a resume whose previous status is _not_
 `UNKNOWN_EXTERNAL_STATE` is still reported as a resume, pinning the behaviour that must not
 be narrowed.
+
+## D-035 — Deployment profiles
+
+`-c profile=standard|minimal`, orthogonal to `-c env`. `standard` is every environment's
+default and is byte-identical to what existed before this decision. `minimal` turns off
+three things — the web ACL, the interface VPC endpoints (with the placement change in
+D-036) and container insights — and is the only supported way to run this service cheaply
+enough to keep a dev environment alive between sessions. An idle `standard` dev
+environment costs roughly four times an idle `minimal` one, almost entirely because of the
+endpoints.
+
+`applyProfile` throws for any environment but `dev`. This follows D-021: a posture that a
+real environment must keep cannot be dropped by a flag on a command line, and the refusal
+belongs at synth time, where every other production input is already checked. Alarms,
+DLQs, redrive policies, conditional writes and the outbox are deliberately _not_
+profile-controlled — INV-45 has no cheap mode, and the entire monitoring stack is a
+rounding error next to the endpoints.
+
+## D-036 — Public-subnet tasks under `minimal`
+
+Removing the interface endpoints without moving the tasks would be incoherent: a
+`PRIVATE_ISOLATED` subnet has no route to ECR, Secrets Manager or CloudWatch Logs once the
+endpoints are gone, so the task would never pull its image. `minimal` therefore also places
+tasks in public subnets with `assignPublicIp: true`, reaching the same services over the
+internet gateway. There is still no NAT gateway in either profile, and the gateway
+endpoints for DynamoDB and S3 are free and stay in both.
+
+This is a real reduction in the security posture, recorded as such rather than softened.
+Two things bound it:
+
+- Ingress is unchanged. The task security group admits the load balancer's security group
+  on 8080 and nothing else; a public IP is not an open port. A test that runs specifically
+  against the minimal profile asserts this.
+- The `0.0.0.0/0:443` egress rule accepted in D-020 was justified by the route table —
+  "isolated subnets have no route to anything else". Under `minimal` that justification is
+  false: the rule genuinely egresses to the internet, which is how the task pulls its image
+  and reads its secret. `network-stack.ts` now states both cases explicitly rather than
+  carrying a comment true in only one of them, and the rule's own description follows the
+  profile.
+
+The refusal outside `dev` (D-035) is what makes this acceptable. Nothing carrying real
+traffic can select it.
+
+## D-037 — The image repository owns its own stack
+
+`ecr.Repository` moved out of `ApiStack` into `EcrStack`. It was previously created by the
+same deployment that starts the service that pulls from it, which made a first deploy
+unresolvable in principle: there was nowhere to push an image before ECS tried to run one,
+and each rolled-back attempt generated a fresh repository name, so an image pushed to the
+previous one was lost. `DEPLOYMENT.md` documented a two-terminal race as the workaround.
+Splitting the stack replaces that with an order anyone can follow — create the repository,
+push, deploy everything else (G-004).
+
+Repositories in an environment whose removal policy is `DESTROY` also get
+`emptyOnDelete: true`. A repository still holding images blocks its own deletion, which
+turns "throw the dev environment away" into a manual hunt through the console. Never where
+the policy is `RETAIN`: production images outlive their stack on purpose.
+
+## D-038 — The stack supplies the region and the public origin
+
+Two values the application had defaults for, which were wrong in every deployed
+environment:
+
+- `AWS_REGION`. ECS does not inject it the way Lambda does, and `packages/config` falls
+  back to `us-east-1`. Any deployment elsewhere pointed its DynamoDB and Secrets Manager
+  clients at a region holding neither the table nor the secret (G-001).
+- `PUBLIC_BASE_URL`, which builds the `pollUrl` returned with every `202`. It defaulted to
+  `http://localhost:8080`, so the recovery path advertised to a timed-out B2B caller
+  pointed at the caller's own machine (G-002).
+
+Both are now rendered by `ApiStack` from values it already holds: the stack's region, and
+either an explicit `-c publicBaseUrl`, the Route 53 record, or the load balancer's own DNS
+name with the scheme its listener actually serves. The application-side defaults remain,
+because they are correct for a local process, but nothing deployed relies on them.

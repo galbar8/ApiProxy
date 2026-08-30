@@ -125,3 +125,31 @@ values, so a misconfigured ladder fails the process instead of producing 502s un
 - SQS messages: schema-validated at runtime before use, even though the producer is us.
 - Environment: schema-validated at startup; missing required production config is fatal.
 - Provider responses: schema-validated before being persisted as a business result.
+
+## Deployment profiles
+
+Two axes, deliberately independent: `-c env` decides capacity and data protection,
+`-c profile` decides how much of the optional infrastructure is deployed (D-035).
+
+|                              | `standard`                     | `minimal`                 |
+| ---------------------------- | ------------------------------ | ------------------------- |
+| Web ACL on the load balancer | yes                            | no                        |
+| Interface VPC endpoints      | 5                              | 0                         |
+| Task placement               | isolated subnets, no public IP | public subnets, public IP |
+| Container insights           | on                             | off                       |
+| Everything else              | —                              | identical                 |
+
+Nothing on the correctness path moves. The state machine, conditional writes, the outbox,
+every queue, every DLQ, every redrive policy and all seventeen alarms are the same in both:
+cost is not a reason to run a queue whose failures nobody sees (INV-45).
+
+What does move is the network path. Removing the interface endpoints removes the only route
+an isolated subnet has to ECR, Secrets Manager and CloudWatch Logs, so the tasks move to
+public subnets and reach those services over the internet gateway instead (D-036). Ingress
+is unchanged in both profiles — the task security group admits the load balancer's
+security group on 8080 and nothing else — but egress genuinely leaves the VPC under
+`minimal`, which is why `applyProfile` refuses it for anything but `dev`.
+
+There is no NAT gateway in either profile, and the free gateway endpoints for DynamoDB and
+S3 stay in both, so DynamoDB traffic and ECR image layers never take a public path
+regardless.

@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 import { App, Tags } from "aws-cdk-lib";
-import { environments, type EnvironmentName } from "../lib/environment.js";
+import {
+  applyProfile,
+  deploymentProfiles,
+  environments,
+  type DeploymentProfile,
+  type EnvironmentName,
+} from "../lib/environment.js";
 import { NetworkStack } from "../lib/network/network-stack.js";
+import { EcrStack } from "../lib/ecr/ecr-stack.js";
 import { DataStack } from "../lib/data/data-stack.js";
 import { MessagingStack } from "../lib/messaging/messaging-stack.js";
 import { WorkersStack } from "../lib/workers/workers-stack.js";
@@ -22,7 +29,21 @@ if (!isEnvironmentName(requestedEnv)) {
   );
 }
 const envName: EnvironmentName = requestedEnv;
-const config = environments[envName];
+
+const isDeploymentProfile = (value: string): value is DeploymentProfile =>
+  (deploymentProfiles as readonly string[]).includes(value);
+
+const requestedProfile = String(app.node.tryGetContext("profile") ?? "standard");
+if (!isDeploymentProfile(requestedProfile)) {
+  throw new Error(
+    `unknown profile "${requestedProfile}"; expected ${deploymentProfiles.join(" or ")}`,
+  );
+}
+const profile: DeploymentProfile = requestedProfile;
+
+// `applyProfile` throws for anything but dev, so a cheap posture cannot be selected for
+// an environment that has to keep it (D-035).
+const config = applyProfile(environments[envName], profile);
 
 /**
  * No account/region lookups anywhere in this app: `cdk synth` must work without
@@ -54,6 +75,11 @@ const splitContextList = (value: unknown): string[] =>
     : [];
 
 const alarmEmails = splitContextList(app.node.tryGetContext("alarmEmails"));
+
+// Optional: the origin callers actually use, when it is something in front of the load
+// balancer. Left unset, ApiStack derives it from the listener and the ALB or the Route 53
+// record below.
+const publicBaseUrl = app.node.tryGetContext("publicBaseUrl") as string | undefined;
 
 // Optional: a stable public name in front of the ALB. Built from supplied attributes, not
 // a hosted-zone lookup, because synth must work without credentials.
@@ -88,6 +114,8 @@ const network = new NetworkStack(app, `${prefix}-Network`, {
   ...(availabilityZones === undefined ? {} : { availabilityZones }),
 });
 const data = new DataStack(app, `${prefix}-Data`, { env, config });
+// Deployed and pushed to before the service that pulls from it exists (D-037).
+const ecr = new EcrStack(app, `${prefix}-Ecr`, { env, config });
 const messaging = new MessagingStack(app, `${prefix}-Messaging`, { env, config });
 
 const workers = new WorkersStack(app, `${prefix}-Workers`, {
@@ -106,9 +134,11 @@ const api = new ApiStack(app, `${prefix}-Api`, {
   albSecurityGroup: network.albSecurityGroup,
   serviceSecurityGroup: network.serviceSecurityGroup,
   table: data.table,
+  repository: ecr.repository,
   imageTag,
   certificateArn,
   ...(domain === undefined ? {} : { domain }),
+  ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
 });
 
 new MonitoringStack(app, `${prefix}-Monitoring`, {
@@ -134,3 +164,4 @@ new MonitoringStack(app, `${prefix}-Monitoring`, {
 
 Tags.of(app).add("service", "workflow-service");
 Tags.of(app).add("environment", envName);
+Tags.of(app).add("profile", profile);

@@ -94,11 +94,23 @@ idempotency rules, every error code, and a complete Axios client.
 **Nothing has been deployed.** The stacks synthesize; they have never been applied to an
 AWS account.
 
-**[`DEPLOYMENT.md`](DEPLOYMENT.md) is the step-by-step guide** — prerequisites, the four
-things to fix before a first deploy, every `-c` context value, the deploy order, populating
-the API-key secret, shipping a new version, and what the alarms mean.
+**[`DEPLOYMENT.md`](DEPLOYMENT.md) is the step-by-step guide**, written for someone who
+has never used AWS — what it costs, what every AWS term means, account setup, the deploy
+order, populating the API-key secret, shipping a new version, what the alarms mean, and
+how to delete all of it again.
 
-The short version:
+A first deploy is one command, which prints what it will create and waits for consent:
+
+```bash
+./scripts/deploy-dev.sh          # PROFILE=standard for the full posture
+./scripts/destroy-dev.sh         # and this removes it all again
+```
+
+There are two **profiles**. `standard` is the real posture. `minimal` drops the web ACL,
+the interface VPC endpoints and container insights — roughly $125/month down to $35/month
+while idle — and is refused for anything but `dev`.
+
+The short version, by hand:
 
 ```bash
 pnpm cdk:synth                       # dev, fully offline

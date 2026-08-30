@@ -1,7 +1,6 @@
 import { CfnOutput, Duration, Stack, type StackProps } from "aws-cdk-lib";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
-import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -10,6 +9,7 @@ import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 import type * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import type * as ecr from "aws-cdk-lib/aws-ecr";
 import type { Construct } from "constructs";
 import { healthCheckDetectionWindow, type EnvironmentConfig } from "../environment.js";
 import { ApiWebAcl } from "./waf.js";
@@ -20,6 +20,8 @@ export interface ApiStackProps extends StackProps {
   readonly albSecurityGroup: ec2.SecurityGroup;
   readonly serviceSecurityGroup: ec2.SecurityGroup;
   readonly table: dynamodb.Table;
+  /** Created by `EcrStack`, so an image exists before the service that pulls it. */
+  readonly repository: ecr.Repository;
   /**
    * Image tag to run. Pushed to ECR before deployment; synth never needs Docker.
    * Production must name an immutable build (a digest, a commit SHA or a version) —
@@ -34,6 +36,12 @@ export interface ApiStackProps extends StackProps {
     readonly zoneName: string;
     readonly recordName: string;
   };
+  /**
+   * The origin B2B callers actually use, when it is neither the load balancer's own DNS
+   * name nor the optional Route 53 record — a CloudFront distribution or an API gateway
+   * in front of this stack, say. Overrides the derived value.
+   */
+  readonly publicBaseUrl?: string;
 }
 
 /** A digest, a git commit SHA, or a version — anything that cannot be repointed. */
@@ -68,8 +76,8 @@ export class ApiStack extends Stack {
   readonly loadBalancer: elbv2.ApplicationLoadBalancer;
   readonly targetGroup: elbv2.ApplicationTargetGroup;
   readonly apiKeySecret: secretsmanager.Secret;
-  readonly repository: ecr.Repository;
-  readonly webAcl: ApiWebAcl;
+  /** Absent when the profile does not deploy a web ACL (`minimal`, dev only). */
+  readonly webAcl?: ApiWebAcl;
   /** Alarms that gate a rollout; a deployment that trips one is rolled back by ECS. */
   readonly deploymentAlarms: cloudwatch.Alarm[];
 
@@ -81,17 +89,6 @@ export class ApiStack extends Stack {
       assertImmutableImageReference(props.imageTag);
     }
 
-    this.repository = new ecr.Repository(this, "ApiRepository", {
-      imageScanOnPush: true,
-      removalPolicy: config.removalPolicy,
-      lifecycleRules: [{ maxImageCount: 20 }],
-      // Belt and braces for the check above: even a correct-looking tag must not be
-      // re-pushed to point at different bytes once production is running it.
-      imageTagMutability: config.isProduction
-        ? ecr.TagMutability.IMMUTABLE
-        : ecr.TagMutability.MUTABLE,
-    });
-
     // Credential store (ADR-0002). The value is populated out of band; the stack creates
     // the container, never the credentials.
     this.apiKeySecret = new secretsmanager.Secret(this, "ApiKeys", {
@@ -101,7 +98,11 @@ export class ApiStack extends Stack {
 
     const cluster = new ecs.Cluster(this, "Cluster", {
       vpc,
-      containerInsightsV2: ecs.ContainerInsights.ENABLED,
+      // Billed per metric, and worth it wherever anyone is on call. The `minimal` profile
+      // turns it off because nobody is watching a dev box.
+      containerInsightsV2: config.containerInsights
+        ? ecs.ContainerInsights.ENABLED
+        : ecs.ContainerInsights.DISABLED,
     });
 
     const taskDefinition = new ecs.FargateTaskDefinition(this, "ApiTask", {
@@ -129,7 +130,7 @@ export class ApiStack extends Stack {
     this.apiKeySecret.grantRead(taskDefinition.taskRole);
 
     const container = taskDefinition.addContainer("api", {
-      image: ecs.ContainerImage.fromEcrRepository(this.repository, props.imageTag),
+      image: ecs.ContainerImage.fromEcrRepository(props.repository, props.imageTag),
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: "api",
         logGroup: new logs.LogGroup(this, "ApiLogs", {
@@ -139,6 +140,11 @@ export class ApiStack extends Stack {
       }),
       environment: {
         APP_ENV: config.envName,
+        // ECS does not inject this (Lambda does, which is why the workers were fine).
+        // Without it the app falls back to us-east-1 and every DynamoDB and Secrets
+        // Manager call from a task outside that region talks to a resource that does not
+        // exist (G-001, D-038).
+        AWS_REGION: this.region,
         PORT: "8080",
         WORKFLOW_TABLE_NAME: props.table.tableName,
         API_KEYS_SECRET_ID: this.apiKeySecret.secretName,
@@ -182,8 +188,17 @@ export class ApiStack extends Stack {
       cluster,
       taskDefinition,
       desiredCount: config.desiredCount,
-      assignPublicIp: false,
-      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+      // Where a task sits is the profile's decision, and the two halves must agree: an
+      // isolated subnet has no route to ECR without the interface endpoints that
+      // `privateNetworking` also controls, so a task placed there without them never
+      // pulls its image. Ingress is identical either way — the security group admits the
+      // load balancer and nothing else (D-036).
+      assignPublicIp: !config.privateNetworking,
+      vpcSubnets: {
+        subnetType: config.privateNetworking
+          ? ec2.SubnetType.PRIVATE_ISOLATED
+          : ec2.SubnetType.PUBLIC,
+      },
       securityGroups: [props.serviceSecurityGroup],
       // Roll back automatically instead of leaving a broken revision serving traffic.
       circuitBreaker: { rollback: true },
@@ -271,6 +286,27 @@ export class ApiStack extends Stack {
       });
     }
 
+    // The `pollUrl` handed to every caller that receives a 202 is built from this. The
+    // application defaults it to http://localhost:8080, so leaving it unset tells each
+    // timed-out B2B client to poll its own machine — the recovery path advertised by the
+    // contract would point nowhere (G-002, D-038).
+    //
+    // It can only be computed here: the value depends on both the listener protocol
+    // decided immediately above and the load balancer's generated DNS name.
+    const scheme = props.certificateArn === undefined ? "http" : "https";
+    const fqdn =
+      props.domain === undefined
+        ? undefined
+        : props.domain.recordName.endsWith(props.domain.zoneName)
+          ? props.domain.recordName
+          : `${props.domain.recordName}.${props.domain.zoneName}`;
+    const publicBaseUrl =
+      props.publicBaseUrl ??
+      (fqdn === undefined
+        ? `${scheme}://${this.loadBalancer.loadBalancerDnsName}`
+        : `https://${fqdn}`);
+    container.addEnvironment("PUBLIC_BASE_URL", publicBaseUrl);
+
     const scaling = this.service.autoScaleTaskCount({
       minCapacity: config.minCapacity,
       maxCapacity: config.maxCapacity,
@@ -295,12 +331,18 @@ export class ApiStack extends Stack {
       scaleOutCooldown: Duration.seconds(30),
     });
 
-    this.webAcl = new ApiWebAcl(this, "Waf", {
-      envName: config.envName,
-      blockOnManagedRules: config.wafBlockOnManagedRules,
-      rateLimitPerIp: config.wafRateLimitPerIp,
-    });
-    this.webAcl.associate("AlbAssociation", this.loadBalancer.loadBalancerArn);
+    // The rate-based rule is the part that matters most to this service: a request is
+    // held open for the whole synchronous wait, so a flood consumes task capacity for far
+    // longer than it would on an ordinary endpoint. `minimal` gives that up along with
+    // the managed rule groups, which is why it is refused outside dev (D-019, D-035).
+    if (config.wafEnabled) {
+      this.webAcl = new ApiWebAcl(this, "Waf", {
+        envName: config.envName,
+        blockOnManagedRules: config.wafBlockOnManagedRules,
+        rateLimitPerIp: config.wafRateLimitPerIp,
+      });
+      this.webAcl.associate("AlbAssociation", this.loadBalancer.loadBalancerArn);
+    }
 
     // A rollout that starts failing requests must be reverted by ECS, not by a human
     // noticing. The circuit breaker only sees tasks that fail to *start*; these alarms
@@ -366,7 +408,7 @@ export class ApiStack extends Stack {
     }
 
     new CfnOutput(this, "AlbDnsName", { value: this.loadBalancer.loadBalancerDnsName });
-    new CfnOutput(this, "EcrRepositoryUri", { value: this.repository.repositoryUri });
+    new CfnOutput(this, "PublicBaseUrl", { value: publicBaseUrl });
     new CfnOutput(this, "ApiKeySecretName", { value: this.apiKeySecret.secretName });
   }
 }

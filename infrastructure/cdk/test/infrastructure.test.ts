@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 import { App } from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import {
+  applyProfile,
   environments,
   healthCheckDetectionWindow,
   requiredVisibilityTimeout,
+  type DeploymentProfile,
   type EnvironmentName,
 } from "../lib/environment.js";
 import { NetworkStack } from "../lib/network/network-stack.js";
+import { EcrStack } from "../lib/ecr/ecr-stack.js";
 import { DataStack } from "../lib/data/data-stack.js";
 import { MessagingStack } from "../lib/messaging/messaging-stack.js";
 import { WorkersStack } from "../lib/workers/workers-stack.js";
@@ -29,10 +32,13 @@ interface BuildOptions {
   readonly imageTag?: string;
   readonly alarmEmails?: readonly string[];
   readonly providerBaseUrl?: string;
+  readonly profile?: DeploymentProfile;
 }
 
 const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
-  const config = environments[envName];
+  // Defaulting to `standard` keeps every assertion below describing the real posture; the
+  // minimal profile is asserted separately, additively, further down.
+  const config = applyProfile(environments[envName], options.profile ?? "standard");
   const withCertificate = options.withCertificate ?? true;
   // Defaults are what a correct production invocation supplies; individual tests override
   // one at a time to prove the guard for that value.
@@ -45,6 +51,7 @@ const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
     availabilityZones: ["us-east-1a", "us-east-1b", "us-east-1c"],
   });
   const data = new DataStack(app, "Data", stackProps);
+  const ecr = new EcrStack(app, "Ecr", stackProps);
   const messaging = new MessagingStack(app, "Msg", stackProps);
   const workers = new WorkersStack(app, "Workers", {
     ...stackProps,
@@ -59,6 +66,7 @@ const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
     albSecurityGroup: network.albSecurityGroup,
     serviceSecurityGroup: network.serviceSecurityGroup,
     table: data.table,
+    repository: ecr.repository,
     imageTag,
     ...(withCertificate ? { certificateArn: TEST_CERT } : {}),
   });
@@ -84,6 +92,7 @@ const buildStacks = (envName: EnvironmentName, options: BuildOptions = {}) => {
     templates: {
       network: Template.fromStack(network),
       data: Template.fromStack(data),
+      ecr: Template.fromStack(ecr),
       messaging: Template.fromStack(messaging),
       workers: Template.fromStack(workers),
       api: Template.fromStack(api),
@@ -549,14 +558,14 @@ describe("image provenance", () => {
 
   it("does not let a production tag be repointed after the fact", () => {
     const { templates } = buildStacks("production");
-    templates.api.hasResourceProperties("AWS::ECR::Repository", {
+    templates.ecr.hasResourceProperties("AWS::ECR::Repository", {
       ImageTagMutability: "IMMUTABLE",
     });
   });
 
   it("leaves dev free to overwrite tags", () => {
     const { templates } = buildStacks("dev", { imageTag: "latest" });
-    templates.api.hasResourceProperties("AWS::ECR::Repository", {
+    templates.ecr.hasResourceProperties("AWS::ECR::Repository", {
       ImageTagMutability: "MUTABLE",
     });
   });
@@ -774,6 +783,224 @@ describe("capacity", () => {
       LoadBalancerAttributes: Match.arrayWith([
         { Key: "deletion_protection.enabled", Value: "true" },
       ]),
+    });
+  });
+});
+
+describe("reachability gaps that only a real deployment would expose", () => {
+  const { templates } = buildStacks("production");
+
+  /**
+   * ECS does not inject `AWS_REGION` into a container the way Lambda does, and
+   * `packages/config` defaults it to `us-east-1`. A task deployed anywhere else would
+   * therefore point its DynamoDB and Secrets Manager clients at a region holding neither
+   * the table nor the secret — and every request would fail (G-001).
+   */
+  it("tells the API container which region it is running in", () => {
+    templates.api.hasResourceProperties("AWS::ECS::TaskDefinition", {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: Match.arrayWith([
+            Match.objectLike({ Name: "AWS_REGION", Value: TEST_ENV.region }),
+          ]),
+        }),
+      ]),
+    });
+  });
+
+  /**
+   * `PUBLIC_BASE_URL` builds the `pollUrl` returned with every 202. The application
+   * default is `http://localhost:8080`, so an unset value hands each timed-out B2B caller
+   * a recovery URL pointing at its own machine (G-002).
+   */
+  it("gives the API container a public origin that is not localhost", () => {
+    const task = Object.values(
+      templates.api.findResources("AWS::ECS::TaskDefinition"),
+    )[0] as {
+      Properties: {
+        ContainerDefinitions: { Environment: { Name: string; Value: unknown }[] }[];
+      };
+    };
+    const entry = task.Properties.ContainerDefinitions[0]?.Environment.find(
+      (variable) => variable.Name === "PUBLIC_BASE_URL",
+    );
+    expect(entry).toBeDefined();
+    expect(JSON.stringify(entry?.Value)).toContain("DNSName");
+    expect(JSON.stringify(entry?.Value)).not.toContain("localhost");
+  });
+
+  it("prefers an explicitly supplied origin over the load balancer's own name", () => {
+    const app = new App();
+    const config = environments.production;
+    const stackProps = { config, env: TEST_ENV };
+    const network = new NetworkStack(app, "Net", {
+      ...stackProps,
+      availabilityZones: ["us-east-1a", "us-east-1b", "us-east-1c"],
+    });
+    const data = new DataStack(app, "Data", stackProps);
+    const ecr = new EcrStack(app, "Ecr", stackProps);
+    const api = new ApiStack(app, "Api", {
+      ...stackProps,
+      vpc: network.vpc,
+      albSecurityGroup: network.albSecurityGroup,
+      serviceSecurityGroup: network.serviceSecurityGroup,
+      table: data.table,
+      repository: ecr.repository,
+      imageTag: "1a2b3c4d5e6f7890",
+      certificateArn: TEST_CERT,
+      publicBaseUrl: "https://api.example.com",
+    });
+    Template.fromStack(api).hasResourceProperties("AWS::ECS::TaskDefinition", {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: Match.arrayWith([
+            Match.objectLike({
+              Name: "PUBLIC_BASE_URL",
+              Value: "https://api.example.com",
+            }),
+          ]),
+        }),
+      ]),
+    });
+  });
+
+  /**
+   * Port 80 carries a listener in every environment — dev serves on it, the others
+   * redirect from it — and the security group previously admitted 443 only, so a dev
+   * environment deployed successfully and could not be called at all (G-003).
+   */
+  it("admits traffic on both listener ports", () => {
+    for (const port of [80, 443]) {
+      templates.network.hasResourceProperties("AWS::EC2::SecurityGroup", {
+        GroupDescription: Match.stringLikeRegexp(
+          "Ingress for the public load balancer",
+        ),
+        SecurityGroupIngress: Match.arrayWith([
+          Match.objectLike({ CidrIp: "0.0.0.0/0", FromPort: port, ToPort: port }),
+        ]),
+      });
+    }
+  });
+
+  /**
+   * The repository and the service that pulls from it must not be created by the same
+   * deployment: on a first deploy there is then nowhere to push an image before the
+   * service tries to run one (G-004).
+   */
+  it("creates the image repository outside the stack that consumes it", () => {
+    templates.ecr.resourceCountIs("AWS::ECR::Repository", 1);
+    templates.api.resourceCountIs("AWS::ECR::Repository", 0);
+  });
+
+  it("lets a throwaway environment actually be thrown away", () => {
+    // A repository still holding images blocks its own deletion, which turns "delete the
+    // dev environment" into a manual hunt through the console.
+    buildStacks("dev").templates.ecr.hasResourceProperties("AWS::ECR::Repository", {
+      EmptyOnDelete: true,
+    });
+    // Never where the policy is RETAIN: production images outlive the stack on purpose.
+    buildStacks("production").templates.ecr.hasResourceProperties(
+      "AWS::ECR::Repository",
+      {
+        EmptyOnDelete: Match.absent(),
+      },
+    );
+  });
+});
+
+describe("deployment profiles", () => {
+  const interfaceEndpointsOf = (template: Template): number =>
+    Object.keys(
+      template.findResources("AWS::EC2::VPCEndpoint", {
+        Properties: { VpcEndpointType: "Interface" },
+      }),
+    ).length;
+
+  /**
+   * The guard this whole feature depends on. `minimal` gives up the web ACL, the private
+   * network path and the container metrics; an environment carrying real traffic may not
+   * lose any of them because a flag was passed on a command line.
+   */
+  it("refuses to strip a real environment down to the minimal profile", () => {
+    for (const envName of ["staging", "production"] as const) {
+      expect(() => buildStacks(envName, { profile: "minimal" })).toThrow(
+        /only available for dev/,
+      );
+    }
+  });
+
+  it("leaves the standard profile as the default, including for dev", () => {
+    const { templates } = buildStacks("dev");
+    templates.api.resourceCountIs("AWS::WAFv2::WebACL", 1);
+    expect(interfaceEndpointsOf(templates.network)).toBe(5);
+    templates.api.hasResourceProperties("AWS::ECS::Cluster", {
+      ClusterSettings: [{ Name: "containerInsights", Value: "enabled" }],
+    });
+  });
+
+  describe("minimal", () => {
+    const { templates } = buildStacks("dev", { profile: "minimal" });
+
+    it("deploys no web ACL at all, not merely a permissive one", () => {
+      templates.api.resourceCountIs("AWS::WAFv2::WebACL", 0);
+      templates.api.resourceCountIs("AWS::WAFv2::WebACLAssociation", 0);
+    });
+
+    it("drops the interface endpoints and keeps the free gateway ones", () => {
+      // The five interface endpoints are the largest standing charge in an idle
+      // environment. The gateway endpoints cost nothing and keep DynamoDB and the ECR
+      // image layers off any public path, so they stay in both profiles.
+      expect(interfaceEndpointsOf(templates.network)).toBe(0);
+      expect(
+        Object.keys(
+          templates.network.findResources("AWS::EC2::VPCEndpoint", {
+            Properties: { VpcEndpointType: "Gateway" },
+          }),
+        ),
+      ).toHaveLength(2);
+    });
+
+    /**
+     * The two halves must agree. An isolated subnet has no route to ECR once the
+     * interface endpoints are gone, so a task left there would never pull its image —
+     * this asserts the placement moved with them.
+     */
+    it("places tasks where they can still reach ECR without those endpoints", () => {
+      templates.api.hasResourceProperties("AWS::ECS::Service", {
+        NetworkConfiguration: Match.objectLike({
+          AwsvpcConfiguration: Match.objectLike({ AssignPublicIp: "ENABLED" }),
+        }),
+      });
+    });
+
+    it("still refuses every route into a task except the load balancer", () => {
+      // A public IP is not an open door: ingress is unchanged, and this is the assertion
+      // that keeps it that way.
+      templates.network.hasResourceProperties("AWS::EC2::SecurityGroup", {
+        GroupDescription: Match.stringLikeRegexp("API tasks"),
+        SecurityGroupIngress: Match.absent(),
+      });
+    });
+
+    it("turns container insights off", () => {
+      templates.api.hasResourceProperties("AWS::ECS::Cluster", {
+        ClusterSettings: [{ Name: "containerInsights", Value: "disabled" }],
+      });
+    });
+
+    it("keeps every queue, DLQ and alarm, which are not the expensive part", () => {
+      // Cost is not a reason to run a queue without a DLQ alarm (INV-45): the whole
+      // monitoring stack is a rounding error next to the endpoints above.
+      const { templates: minimal } = buildStacks("dev", { profile: "minimal" });
+      expect(
+        Object.keys(minimal.monitoring.findResources("AWS::CloudWatch::Alarm")).length,
+      ).toBe(
+        Object.keys(
+          buildStacks("dev").templates.monitoring.findResources(
+            "AWS::CloudWatch::Alarm",
+          ),
+        ).length,
+      );
     });
   });
 });
