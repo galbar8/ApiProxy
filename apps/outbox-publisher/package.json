@@ -1,0 +1,23 @@
+{
+  "name": "@workflow/outbox-publisher",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@workflow/contracts": "workspace:*",
+    "@workflow/config": "workspace:*",
+    "@workflow/observability": "workspace:*",
+    "@workflow/persistence": "workspace:*",
+    "@workflow/messaging": "workspace:*",
+    "@aws-sdk/util-dynamodb": "^3.716.0",
+    "@aws-sdk/client-dynamodb": "^3.716.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.146"
+  }
+}

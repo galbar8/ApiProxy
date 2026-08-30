@@ -1,0 +1,8 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "infrastructure/cdk"
+
+# esbuild ships a platform binary via a postinstall script; tsx/vitest need it.
+allowBuilds:
+  esbuild: true

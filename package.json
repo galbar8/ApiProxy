@@ -1,0 +1,41 @@
+{
+  "name": "sync-over-async-workflow-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Production-grade synchronous B2B HTTP API over an asynchronous AWS workflow",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsx scripts/build.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p infrastructure/cdk/tsconfig.json --noEmit",
+    "test": "vitest run --config vitest.unit.config.ts",
+    "test:watch": "vitest --config vitest.unit.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:chaos": "vitest run --config vitest.chaos.config.ts",
+    "test:load": "tsx tests/load/run-load.ts",
+    "cdk:synth": "cdk synth --quiet",
+    "cdk:diff": "cdk diff",
+    "local:up": "docker compose -f docker-compose.local.yml up -d --wait",
+    "local:down": "docker compose -f docker-compose.local.yml down -v"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.2",
+    "aws-cdk": "^2.174.0",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.1",
+    "vitest": "^2.1.8",
+    "esbuild": "^0.24.2"
+  }
+}

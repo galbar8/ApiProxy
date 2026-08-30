@@ -1,0 +1,18 @@
+{
+  // aws-cdk-lib's prop interfaces declare optional properties as `foo?: string` while
+  // internally passing `undefined`, which `exactOptionalPropertyTypes` rejects. Rather
+  // than sprinkle casts through the stacks, that one check is relaxed here and nowhere
+  // else: every other strictness flag still applies to infrastructure code.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "exactOptionalPropertyTypes": false,
+    "baseUrl": "../..",
+    "paths": {
+      "@workflow/contracts": ["packages/contracts/src/index.ts"],
+      "@workflow/persistence": ["packages/persistence/src/index.ts"],
+      "@workflow/observability": ["packages/observability/src/index.ts"]
+    }
+  },
+  "include": ["bin/**/*.ts", "lib/**/*.ts", "test/**/*.ts"]
+}
